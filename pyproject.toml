@@ -1,0 +1,16 @@
+[project]
+name = "pais-e-filhos"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "django>=6.0.4",
+    "djangorestframework>=3.17.1",
+    "djangorestframework-simplejwt>=5.5.1",
+    "django-cors-headers>=4.3.0",
+    "firebase-admin>=6.1.0",
+    "reportlab>=4.0.0",
+    "channels>=4.2.0",
+    "daphne>=4.0.0",
+]
