@@ -8,6 +8,15 @@ class Conversation(models.Model):
     def __str__(self):
         return f"Conversation {self.id}"
 
+
+class UserProfile(models.Model):
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='coparent_profile')
+    birth_date = models.DateField()
+
+    def __str__(self):
+        return f"Profile {self.user.username}"
+
+
 class Message(models.Model):
     conversation = models.ForeignKey(Conversation, on_delete=models.CASCADE)
     sender = models.ForeignKey(User, on_delete=models.CASCADE)
@@ -47,6 +56,7 @@ class Event(models.Model):
     def __str__(self):
         return f"{self.title} ({self.event_date})"
 
+
 class MessageRead(models.Model):
     message = models.ForeignKey(Message, on_delete=models.CASCADE)
     reader = models.ForeignKey(User, on_delete=models.CASCADE)
@@ -84,7 +94,11 @@ class Notification(models.Model):
 class Child(models.Model):
     conversation = models.ForeignKey(Conversation, on_delete=models.CASCADE, related_name='children')
     name = models.CharField(max_length=100)
-    birth_date = models.DateField(null=True, blank=True)
+    birth_date = models.DateField()
+    cpf = models.CharField(max_length=14, blank=True, default='')
+    rg = models.CharField(max_length=20, blank=True, default='')
+    photo = models.ImageField(upload_to='children_photos/', null=True, blank=True)
+    has_custody = models.BooleanField(default=False)
     created_by = models.ForeignKey(User, on_delete=models.CASCADE)
     created_at = models.DateTimeField(auto_now_add=True)
 

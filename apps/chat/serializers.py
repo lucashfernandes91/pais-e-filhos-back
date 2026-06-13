@@ -4,6 +4,7 @@ from .models import Message, Event, MessageRead, DeviceToken, Notification, Conv
 class MessageSerializer(serializers.ModelSerializer):
     sender = serializers.StringRelatedField()
     attachment_url = serializers.SerializerMethodField()
+    read_by = serializers.SerializerMethodField()
 
     def get_attachment_url(self, obj):
         if obj.attachment:
@@ -13,9 +14,13 @@ class MessageSerializer(serializers.ModelSerializer):
             return obj.attachment.url
         return None
 
+    def get_read_by(self, obj):
+        reads = MessageRead.objects.filter(message=obj)
+        return MessageReadSerializer(reads, many=True).data
+
     class Meta:
         model = Message
-        fields = ['id', 'conversation', 'sender', 'content', 'attachment_url', 'attachment_type', 'created_at']
+        fields = ['id', 'conversation', 'sender', 'content', 'attachment_url', 'attachment_type', 'created_at', 'read_by']
 
 class MessageReadSerializer(serializers.ModelSerializer):
     reader_name = serializers.CharField(source='reader.username', read_only=True)
@@ -57,7 +62,16 @@ class NotificationSerializer(serializers.ModelSerializer):
 
 class ChildSerializer(serializers.ModelSerializer):
     created_by_name = serializers.CharField(source='created_by.username', read_only=True)
+    photo_url = serializers.SerializerMethodField()
+
+    def get_photo_url(self, obj):
+        if obj.photo:
+            request = self.context.get('request')
+            if request:
+                return request.build_absolute_uri(obj.photo.url)
+            return obj.photo.url
+        return None
 
     class Meta:
         model = Child
-        fields = ['id', 'name', 'birth_date', 'conversation', 'created_by_name', 'created_at']
+        fields = ['id', 'name', 'birth_date', 'cpf', 'rg', 'photo_url', 'has_custody', 'conversation', 'created_by_name', 'created_at']
