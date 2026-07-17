@@ -1,7 +1,5 @@
 from django.contrib import admin
 from django.urls import path, include
-from django.conf import settings
-from django.conf.urls.static import static
 from rest_framework_simplejwt.views import TokenObtainPairView
 from .auth_views import SafeTokenRefreshView
 
@@ -12,5 +10,5 @@ urlpatterns = [
     path('api/', include('apps.chat.urls')),
 ]
 
-if settings.DEBUG:
-    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+# B2: /media/ não é mais servido publicamente — anexos e fotos saem
+# pelos endpoints autenticados em apps/chat (api/media/...), em dev e em prod.

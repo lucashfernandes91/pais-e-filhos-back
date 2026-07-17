@@ -91,12 +91,15 @@ def send_message_notification(message_obj):
                     body=body
                 )
 
-                # Try to send via Firebase (if available)
-                try:
-                    device_token = recipient.device_token.token
-                    send_push_notification(device_token, title, body)
-                except Exception as e:
-                    logger.debug(f"Firebase push for {recipient.username} failed: {e}")
+                # Try to send via Firebase (if available) — B7: todos os aparelhos
+                for device in recipient.device_tokens.all():
+                    try:
+                        delivered = send_push_notification(device.token, title, body)
+                        if delivered is False and FIREBASE_INITIALIZED:
+                            # Token recusado pelo FCM: aparelho desinstalou/expirou.
+                            device.delete()
+                    except Exception as e:
+                        logger.debug(f"Firebase push for {recipient.username} failed: {e}")
             except Exception as e:
                 logger.warning(f"Could not create notification for {recipient.username}: {e}")
 
@@ -131,12 +134,15 @@ def send_event_notification(event_obj):
                     body=body
                 )
 
-                # Try to send via Firebase (if available)
-                try:
-                    device_token = recipient.device_token.token
-                    send_push_notification(device_token, title, body)
-                except Exception as e:
-                    logger.debug(f"Firebase push for {recipient.username} failed: {e}")
+                # Try to send via Firebase (if available) — B7: todos os aparelhos
+                for device in recipient.device_tokens.all():
+                    try:
+                        delivered = send_push_notification(device.token, title, body)
+                        if delivered is False and FIREBASE_INITIALIZED:
+                            # Token recusado pelo FCM: aparelho desinstalou/expirou.
+                            device.delete()
+                    except Exception as e:
+                        logger.debug(f"Firebase push for {recipient.username} failed: {e}")
             except Exception as e:
                 logger.warning(f"Could not create event notification for {recipient.username}: {e}")
 

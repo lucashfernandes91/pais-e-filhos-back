@@ -2,6 +2,7 @@
 Centralized error handling for CoParent API
 """
 
+from django.core.exceptions import ValidationError as DjangoValidationError
 from rest_framework.response import Response
 from rest_framework import status
 import logging
@@ -101,6 +102,9 @@ def handle_exception(exception: Exception):
 
     if isinstance(exception, ValueError):
         return ValidationError(str(exception)).to_response()
+    elif isinstance(exception, DjangoValidationError):
+        messages = getattr(exception, 'messages', None) or [str(exception)]
+        return ValidationError(" ".join(messages)).to_response()
     elif isinstance(exception, PermissionError):
         return ForbiddenError().to_response()
     else:

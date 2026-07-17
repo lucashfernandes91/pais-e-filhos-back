@@ -1,22 +1,40 @@
 from django.urls import path
 from .views import (
-    register_user, user_profile,
+    register_user, logout_user, user_profile,
     send_message, send_message_with_attachment, list_messages, message_detail, mark_message_read,
     create_event, list_events, delete_event, update_event,
     register_device_token, list_notifications,
     mark_all_notifications_read, delete_all_notifications, mark_notification_read, unread_notifications_count,
     export_conversation_pdf,
     list_children, create_child, update_child, delete_child,
-    list_conversations
+    list_conversations,
+    create_invite, accept_invite,
+    request_password_reset, verify_password_reset, confirm_password_reset,
+    verify_email, resend_email_verification,
+    serve_message_attachment, serve_child_photo
 )
 
 urlpatterns = [
     # Auth
     path('register/', register_user),
+    path('logout/', logout_user),
     path('profile/', user_profile),
+    path('password-reset/request/', request_password_reset),
+    path('password-reset/verify/', verify_password_reset),
+    path('password-reset/confirm/', confirm_password_reset),
+    path('email/verify/', verify_email),
+    path('email/verify/resend/', resend_email_verification),
 
     # Conversations
     path('conversations/', list_conversations),
+
+    # Invites
+    path('invites/', create_invite),
+    path('invites/accept/', accept_invite),
+
+    # Media (autenticada)
+    path('media/attachments/<int:message_id>/', serve_message_attachment),
+    path('media/children/<int:child_id>/photo/', serve_child_photo),
 
     # Messages
     path('messages/<int:conversation_id>/', list_messages),

@@ -7,16 +7,19 @@ class MessageSerializer(serializers.ModelSerializer):
     read_by = serializers.SerializerMethodField()
 
     def get_attachment_url(self, obj):
+        # B2: anexos saem por endpoint autenticado, não por /media/ público.
         if obj.attachment:
+            path = f'/api/media/attachments/{obj.id}/'
             request = self.context.get('request')
             if request:
-                return request.build_absolute_uri(obj.attachment.url)
-            return obj.attachment.url
+                return request.build_absolute_uri(path)
+            return path
         return None
 
     def get_read_by(self, obj):
-        reads = MessageRead.objects.filter(message=obj)
-        return MessageReadSerializer(reads, many=True).data
+        # B9: usa a relação (aproveitando prefetch_related da view) em vez
+        # de uma query por mensagem.
+        return MessageReadSerializer(obj.messageread_set.all(), many=True).data
 
     class Meta:
         model = Message
@@ -34,8 +37,7 @@ class MessageDetailSerializer(serializers.ModelSerializer):
     read_by = serializers.SerializerMethodField()
 
     def get_read_by(self, obj):
-        reads = MessageRead.objects.filter(message=obj)
-        return MessageReadSerializer(reads, many=True).data
+        return MessageReadSerializer(obj.messageread_set.all(), many=True).data
 
     class Meta:
         model = Message
@@ -65,11 +67,13 @@ class ChildSerializer(serializers.ModelSerializer):
     photo_url = serializers.SerializerMethodField()
 
     def get_photo_url(self, obj):
+        # B2: fotos de crianças saem por endpoint autenticado.
         if obj.photo:
+            path = f'/api/media/children/{obj.id}/photo/'
             request = self.context.get('request')
             if request:
-                return request.build_absolute_uri(obj.photo.url)
-            return obj.photo.url
+                return request.build_absolute_uri(path)
+            return path
         return None
 
     class Meta:

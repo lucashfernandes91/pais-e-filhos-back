@@ -9,12 +9,68 @@ class Conversation(models.Model):
         return f"Conversation {self.id}"
 
 
+class ConversationInvite(models.Model):
+    """Convite para o segundo responsável entrar na conversa.
+
+    Apenas um convite pendente por conversa: gerar um novo apaga o anterior.
+    """
+
+    conversation = models.ForeignKey(Conversation, on_delete=models.CASCADE, related_name='invites')
+    code = models.CharField(max_length=12, unique=True)
+    created_by = models.ForeignKey(User, on_delete=models.CASCADE)
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField()
+    accepted_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True, related_name='accepted_invites'
+    )
+    accepted_at = models.DateTimeField(null=True, blank=True)
+
+    def __str__(self):
+        return f"Invite {self.code} → Conversation {self.conversation_id}"
+
+
+class PasswordResetCode(models.Model):
+    """Código de 6 dígitos para redefinição de senha.
+
+    Apenas o código mais recente não usado vale; pedidos anteriores
+    ficam registrados para o rate limit por janela.
+    """
+
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='password_reset_codes')
+    code = models.CharField(max_length=6)
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField()
+    attempts = models.PositiveSmallIntegerField(default=0)
+    used_at = models.DateTimeField(null=True, blank=True)
+
+    def __str__(self):
+        return f"Reset code for {self.user.username}"
+
+
 class UserProfile(models.Model):
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='coparent_profile')
     birth_date = models.DateField()
+    email_verified_at = models.DateTimeField(null=True, blank=True)
 
     def __str__(self):
         return f"Profile {self.user.username}"
+
+
+class EmailVerificationCode(models.Model):
+    """Código de 6 dígitos para confirmar o e-mail da conta.
+
+    Mesmo contrato do PasswordResetCode: só o mais recente não usado vale.
+    """
+
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='email_verification_codes')
+    code = models.CharField(max_length=6)
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField()
+    attempts = models.PositiveSmallIntegerField(default=0)
+    used_at = models.DateTimeField(null=True, blank=True)
+
+    def __str__(self):
+        return f"Email verification for {self.user.username}"
 
 
 class Message(models.Model):
@@ -69,8 +125,14 @@ class MessageRead(models.Model):
         return f"{self.reader.username} leu {self.message.id}"
 
 class DeviceToken(models.Model):
-    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='device_token')
-    token = models.TextField()
+    """Um registro por aparelho: o mesmo usuário pode ter vários devices.
+
+    O token FCM identifica o aparelho; trocar de conta no mesmo aparelho
+    reatribui o token ao novo usuário.
+    """
+
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='device_tokens')
+    token = models.TextField(unique=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

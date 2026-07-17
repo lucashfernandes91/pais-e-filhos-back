@@ -4,12 +4,25 @@ Generates PDF from messages and events
 """
 
 from io import BytesIO
-from datetime import datetime
-from reportlab.lib.pagesizes import letter, A4
+from django.utils import timezone
+from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
 from reportlab.lib import colors
+
+MESSAGE_EXCERPT_LENGTH = 500
+
+ATTACHMENT_LABELS = {
+    'image': 'Imagem',
+    'pdf': 'PDF',
+    'document': 'Documento',
+}
+
+
+def _local(dt):
+    """Timestamps no fuso do projeto (hoje UTC; muda junto com o TIME_ZONE)."""
+    return timezone.localtime(dt) if timezone.is_aware(dt) else dt
 
 
 def generate_conversation_pdf(messages, events, conversation_id):
@@ -49,47 +62,56 @@ def generate_conversation_pdf(messages, events, conversation_id):
         textColor=colors.HexColor('#757575'),
         spaceAfter=20,
     )
+    now_local = _local(timezone.now())
     story.append(Paragraph(f"<b>Conversa:</b> #{conversation_id}", meta_style))
-    story.append(Paragraph(f"<b>Gerado em:</b> {datetime.now().strftime('%d/%m/%Y às %H:%M')}", meta_style))
+    story.append(Paragraph(f"<b>Gerado em:</b> {now_local.strftime('%d/%m/%Y às %H:%M')}", meta_style))
     story.append(Spacer(1, 0.3*inch))
-    
-    # Messages Section
+
+    # Messages Section — sem limite: o export é o registro completo.
     if messages:
         story.append(Paragraph("Mensagens", styles['Heading2']))
         story.append(Spacer(1, 0.2*inch))
-        
-        for msg in messages[:100]:  # Limit to 100 messages
+
+        for msg in messages:
             sender = msg.sender.first_name or msg.sender.username
-            timestamp = msg.created_at.strftime('%d/%m/%Y %H:%M')
-            
-            # Check if read
-            read_status = "Lido"
-            if msg.messageread_set.exists():
-                read_at = msg.messageread_set.first().read_at.strftime('%H:%M')
+            timestamp = _local(msg.created_at).strftime('%d/%m/%Y %H:%M')
+
+            first_read = msg.messageread_set.first()
+            if first_read is not None:
+                read_at = _local(first_read.read_at).strftime('%d/%m/%Y %H:%M')
                 read_status = f"Lido às {read_at}"
             else:
                 read_status = "Entregue"
-            
+
+            content = msg.content or ''
+            if len(content) > MESSAGE_EXCERPT_LENGTH:
+                content = content[:MESSAGE_EXCERPT_LENGTH] + '…'
+
+            attachment_note = ''
+            if msg.attachment:
+                label = ATTACHMENT_LABELS.get(msg.attachment_type, 'Arquivo')
+                attachment_note = f"<i>[Anexo: {label}]</i><br/>"
+
             msg_text = f"""
             <b>{sender}</b> — {timestamp}<br/>
-            {msg.content[:200]}...<br/>
-            <i style="color: #999">{read_status}</i>
+            {content}<br/>
+            {attachment_note}<i>{read_status}</i>
             <br/><br/>
             """
             story.append(Paragraph(msg_text, styles['Normal']))
-        
+
         story.append(PageBreak())
-    
-    # Events Section
+
+    # Events Section — sem limite.
     if events:
         story.append(Paragraph("Eventos", styles['Heading2']))
         story.append(Spacer(1, 0.2*inch))
-        
-        for event in events[:50]:  # Limit to 50 events
+
+        for event in events:
             creator = event.created_by.first_name or event.created_by.username
-            event_date = event.event_date.strftime('%d/%m/%Y %H:%M')
+            event_date = _local(event.event_date).strftime('%d/%m/%Y %H:%M')
             event_type = event.get_event_type_display()
-            
+
             event_text = f"""
             <b>{event.title}</b> ({event_type})<br/>
             Data: {event_date}<br/>
@@ -98,9 +120,9 @@ def generate_conversation_pdf(messages, events, conversation_id):
             <br/>
             """
             story.append(Paragraph(event_text, styles['Normal']))
-        
+
         story.append(Spacer(1, 0.3*inch))
-    
+
     # Footer
     footer_style = ParagraphStyle(
         'Footer',
@@ -111,8 +133,8 @@ def generate_conversation_pdf(messages, events, conversation_id):
     )
     story.append(Spacer(1, 0.3*inch))
     story.append(Paragraph(
-        "Este documento é um registro oficial mantido por CoParent Lite.<br/>"
-        "Não pode ser editado. Data: " + datetime.now().strftime('%d/%m/%Y'),
+        "Este documento é um registro mantido por CoParent Lite.<br/>"
+        "Não pode ser editado. Data: " + now_local.strftime('%d/%m/%Y'),
         footer_style
     ))
     
