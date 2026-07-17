@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import Message, Event, MessageRead, DeviceToken, Notification, Conversation, Child
+from .models import Message, Event, MessageRead, Notification, Conversation, Child
 
 class MessageSerializer(serializers.ModelSerializer):
     sender = serializers.StringRelatedField()
@@ -50,11 +50,6 @@ class EventSerializer(serializers.ModelSerializer):
     class Meta:
         model = Event
         fields = ['id', 'conversation', 'title', 'event_date', 'event_date_end', 'event_type', 'notes', 'created_at', 'created_by_name']
-
-class DeviceTokenSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = DeviceToken
-        fields = ['token']
 
 class NotificationSerializer(serializers.ModelSerializer):
     class Meta:

@@ -12,12 +12,20 @@ class ChatConsumer(AsyncWebsocketConsumer):
         self.conversation_id = self.scope['url_route']['kwargs']['conversation_id']
         self.user = None
 
-        # Extract token from query string
-        query_string = self.scope.get('query_string', b'').decode()
+        # Token preferencialmente no header Authorization (não vaza em logs);
+        # query string mantida como fallback para clientes antigos.
         token = None
+        for name, value in self.scope.get('headers', []):
+            if name == b'authorization':
+                decoded = value.decode()
+                if decoded.lower().startswith('bearer '):
+                    token = decoded[7:]
+                break
 
-        if 'token=' in query_string:
-            token = query_string.split('token=')[1].split('&')[0]
+        if not token:
+            query_string = self.scope.get('query_string', b'').decode()
+            if 'token=' in query_string:
+                token = query_string.split('token=')[1].split('&')[0]
 
         if not token:
             await self.close(code=4001)

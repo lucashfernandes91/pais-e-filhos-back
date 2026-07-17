@@ -6,14 +6,14 @@ from django.db import transaction
 from django.http import FileResponse
 from django.utils import timezone
 from .models import Message, Conversation, ConversationInvite, Event, MessageRead, DeviceToken, Notification, Child, EmailVerificationCode, PasswordResetCode, UserProfile
-from .serializers import MessageSerializer, EventSerializer, MessageDetailSerializer, DeviceTokenSerializer, NotificationSerializer, ChildSerializer
+from .serializers import MessageSerializer, EventSerializer, MessageDetailSerializer, NotificationSerializer, ChildSerializer
 from django.utils import timezone
 from django.core.mail import send_mail
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.validators import EmailValidator
 from core.pdf_generator import generate_conversation_pdf
-from core.error_handler import ValidationError, NotFoundError, ForbiddenError, ServerError, RateLimitError, handle_exception
+from core.error_handler import ValidationError, NotFoundError, ForbiddenError, RateLimitError, handle_exception
 from django.contrib.auth.models import User
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.exceptions import TokenError
@@ -1094,7 +1094,7 @@ def delete_event(request, event_id):
         except Event.DoesNotExist:
             return NotFoundError("Evento").to_response()
 
-        # Check authorization (only creator or conversation admin can delete)
+        # Check authorization: qualquer participante da conversa pode excluir
         if not event.conversation.participants.filter(id=request.user.id).exists():
             return ForbiddenError("VocÃª nÃ£o faz parte dessa conversa").to_response()
 

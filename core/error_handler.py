@@ -51,30 +51,12 @@ class NotFoundError(ApiError):
         )
 
 
-class UnauthorizedError(ApiError):
-    def __init__(self, message: str = "Não autorizado"):
-        super().__init__(
-            code='UNAUTHORIZED',
-            message=message,
-            status_code=status.HTTP_401_UNAUTHORIZED
-        )
-
-
 class ForbiddenError(ApiError):
     def __init__(self, message: str = "Acesso negado"):
         super().__init__(
             code='FORBIDDEN',
             message=message,
             status_code=status.HTTP_403_FORBIDDEN
-        )
-
-
-class ConflictError(ApiError):
-    def __init__(self, message: str = "Conflito de dados"):
-        super().__init__(
-            code='CONFLICT',
-            message=message,
-            status_code=status.HTTP_409_CONFLICT
         )
 
 
