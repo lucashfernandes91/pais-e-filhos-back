@@ -12,5 +12,7 @@ dependencies = [
     "firebase-admin>=6.1.0",
     "reportlab>=4.0.0",
     "channels>=4.2.0",
+    "channels-redis>=4.2.0",
     "daphne>=4.0.0",
+    "psycopg[binary]>=3.2.0",
 ]

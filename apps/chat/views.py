@@ -3,6 +3,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from rest_framework.response import Response
 from django.db import transaction
+from django.conf import settings
 from django.http import FileResponse
 from django.utils import timezone
 from .models import Message, Conversation, ConversationInvite, Event, MessageRead, DeviceToken, Notification, Child, ChildLegalDeclaration, EmailVerificationCode, PasswordResetCode, UserProfile, LegalAcceptance
@@ -34,7 +35,6 @@ INVITE_TTL_DAYS = 7
 INVITE_CODE_LENGTH = 8
 # Sem 0/O/1/I/L para o código sobreviver a ditado por telefone.
 INVITE_CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'
-INVITE_LINK_BASE = 'https://coparent.app/convite/'
 
 # Códigos por e-mail — reset de senha e confirmação de e-mail compartilham
 # as regras (decisões de 2026-07-16): 6 dígitos, 15 minutos, 5 tentativas,
@@ -652,7 +652,7 @@ def create_invite(request):
         return Response({
             'status': 'ok',
             'code': invite.code,
-            'invite_url': f'{INVITE_LINK_BASE}{invite.code}',
+            'invite_url': f'{settings.INVITE_LINK_BASE}{invite.code}',
             'expires_at': invite.expires_at,
         }, status=201)
 
