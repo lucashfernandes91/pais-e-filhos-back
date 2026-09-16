@@ -1,16 +1,36 @@
 from django.contrib.auth.models import User
 from django.core import mail
 from django.core.files.uploadedfile import SimpleUploadedFile
-from django.test import override_settings
+from django.test import SimpleTestCase, override_settings
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
 from rest_framework_simplejwt.tokens import RefreshToken
+from unittest.mock import patch
 
-from .models import Child, Conversation, ConversationInvite, DeviceToken, EmailVerificationCode, Event, Message, Notification, PasswordResetCode, UserProfile
-from datetime import timedelta
+from .models import Child, ChildLegalDeclaration, Conversation, ConversationInvite, DeviceToken, EmailVerificationCode, Event, LegalAcceptance, Message, Notification, PasswordResetCode, UserProfile
+from .legal import CURRENT_PRIVACY_VERSION, CURRENT_TERMS_VERSION
+from core.firebase_helpers import MESSAGE_NOTIFICATION_BODY, MESSAGE_NOTIFICATION_TITLE, send_message_push_notification
+from datetime import date, timedelta
 import shutil
 import tempfile
+
+
+class PublicLegalDocumentsTests(SimpleTestCase):
+    def test_privacy_policy_is_public_and_current(self):
+        response = self.client.get('/privacy')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, 'Política de Privacidade e LGPD')
+        self.assertContains(response, '68.303.469/0001-33')
+
+    def test_terms_of_use_are_public_and_current(self):
+        response = self.client.get('/terms')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, 'Termos de Uso')
+        self.assertContains(response, 'Santo Antônio da Patrulha')
+        self.assertContains(response, 'direito de escolher outro foro competente')
 
 
 class TokenRefreshTests(APITestCase):
@@ -28,6 +48,35 @@ class TokenRefreshTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
 
+class TokenLoginTests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username="parent_one",
+            email="parent@example.com",
+            password="SenhaForte!42",
+        )
+
+    def test_login_accepts_username(self):
+        response = self.client.post(
+            "/api/token/",
+            {"username": "parent_one", "password": "SenhaForte!42"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["username"], self.user.username)
+
+    def test_login_accepts_email_case_insensitively(self):
+        response = self.client.post(
+            "/api/token/",
+            {"username": "PARENT@example.com", "password": "SenhaForte!42"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["username"], self.user.username)
+
+
 class ConversationInitializationTests(APITestCase):
     def test_registration_creates_and_returns_initial_conversation(self):
         response = self.client.post(
@@ -39,6 +88,11 @@ class ConversationInitializationTests(APITestCase):
                 "birth_date": "1990-04-18",
                 "email": "parent@example.com",
                 "password": "SenhaForte!42",
+                "terms_version": CURRENT_TERMS_VERSION,
+                "privacy_version": CURRENT_PRIVACY_VERSION,
+                "accept_terms": True,
+                "accept_privacy": True,
+                "declare_adult": True,
             },
             format="json",
         )
@@ -47,6 +101,10 @@ class ConversationInitializationTests(APITestCase):
         conversation = Conversation.objects.get(id=response.data["conversation_id"])
         self.assertTrue(conversation.participants.filter(username="new_parent").exists())
         self.assertEqual(UserProfile.objects.get(user__username="new_parent").birth_date.isoformat(), "1990-04-18")
+        acceptance = LegalAcceptance.objects.get(user__username="new_parent")
+        self.assertEqual(acceptance.terms_version, CURRENT_TERMS_VERSION)
+        self.assertEqual(acceptance.privacy_version, CURRENT_PRIVACY_VERSION)
+        self.assertIsNotNone(acceptance.accepted_at)
 
         self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {response.data['access']}")
         for endpoint in ("messages", "events", "children"):
@@ -82,6 +140,111 @@ class ConversationInitializationTests(APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
+    def test_registration_requires_legal_acceptance(self):
+        response = self.client.post(
+            "/api/register/",
+            {
+                "first_name": "Ana",
+                "last_name": "Silva",
+                "username": "without_acceptance",
+                "birth_date": "1990-04-18",
+                "email": "without@example.com",
+                "password": "SenhaForte!42",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(User.objects.filter(username="without_acceptance").exists())
+
+    def test_registration_rejects_minor(self):
+        response = self.client.post(
+            "/api/register/",
+            {
+                "first_name": "Ana",
+                "last_name": "Silva",
+                "username": "minor_parent",
+                "birth_date": "2010-04-18",
+                "email": "minor@example.com",
+                "password": "SenhaForte!42",
+                "terms_version": CURRENT_TERMS_VERSION,
+                "privacy_version": CURRENT_PRIVACY_VERSION,
+                "accept_terms": True,
+                "accept_privacy": True,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(User.objects.filter(username="minor_parent").exists())
+
+    def test_registration_requires_adult_declaration(self):
+        response = self.client.post(
+            "/api/register/",
+            {
+                "first_name": "Ana",
+                "last_name": "Silva",
+                "username": "adult_parent",
+                "birth_date": "1990-04-18",
+                "email": "adult@example.com",
+                "password": "SenhaForte!42",
+                "terms_version": CURRENT_TERMS_VERSION,
+                "privacy_version": CURRENT_PRIVACY_VERSION,
+                "accept_terms": True,
+                "accept_privacy": True,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(User.objects.filter(username="adult_parent").exists())
+
+    def test_existing_account_can_check_and_record_current_acceptance(self):
+        user = User.objects.create_user(username="legacy_parent", password="password123")
+        access_token = str(RefreshToken.for_user(user).access_token)
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {access_token}")
+
+        status_response = self.client.get("/api/legal/acceptance/")
+        self.assertEqual(status_response.status_code, status.HTTP_200_OK)
+        self.assertTrue(status_response.data["required"])
+        self.assertFalse(status_response.data["accepted"])
+
+        accept_response = self.client.post(
+            "/api/legal/acceptance/",
+            {
+                "terms_version": CURRENT_TERMS_VERSION,
+                "privacy_version": CURRENT_PRIVACY_VERSION,
+                "accept_terms": True,
+                "accept_privacy": True,
+            },
+            format="json",
+        )
+        self.assertEqual(accept_response.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(LegalAcceptance.objects.filter(user=user).exists())
+
+        status_response = self.client.get("/api/legal/acceptance/")
+        self.assertFalse(status_response.data["required"])
+        self.assertTrue(status_response.data["accepted"])
+
+    def test_acceptance_rejects_outdated_document_versions(self):
+        user = User.objects.create_user(username="legacy_parent", password="password123")
+        access_token = str(RefreshToken.for_user(user).access_token)
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {access_token}")
+
+        response = self.client.post(
+            "/api/legal/acceptance/",
+            {
+                "terms_version": "0.0",
+                "privacy_version": CURRENT_PRIVACY_VERSION,
+                "accept_terms": True,
+                "accept_privacy": True,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(LegalAcceptance.objects.filter(user=user).exists())
+
 
 class ChildUpdateTests(APITestCase):
     def setUp(self):
@@ -98,8 +261,6 @@ class ChildUpdateTests(APITestCase):
             created_by=self.user,
             name="Clara",
             birth_date="2021-05-26",
-            cpf="000.000.000-00",
-            rg="123",
             has_custody=True,
         )
         access_token = str(RefreshToken.for_user(self.user).access_token)
@@ -111,8 +272,6 @@ class ChildUpdateTests(APITestCase):
             {
                 "name": "Clara Silva",
                 "birth_date": "2021-05-27",
-                "cpf": "",
-                "rg": "",
                 "has_custody": False,
             },
             format="json",
@@ -122,8 +281,6 @@ class ChildUpdateTests(APITestCase):
         self.child.refresh_from_db()
         self.assertEqual(self.child.name, "Clara Silva")
         self.assertEqual(self.child.birth_date.isoformat(), "2021-05-27")
-        self.assertEqual(self.child.cpf, "")
-        self.assertEqual(self.child.rg, "")
         self.assertFalse(self.child.has_custody)
 
     def test_patch_child_rejects_non_participant(self):
@@ -218,6 +375,40 @@ class NotificationBulkActionTests(APITestCase):
         self.assertEqual(response.data["deleted_count"], 2)
         self.assertFalse(Notification.objects.filter(recipient=self.user).exists())
         self.assertTrue(Notification.objects.filter(id=other_notification.id).exists())
+
+
+class MessageNotificationPrivacyTests(APITestCase):
+    def setUp(self):
+        self.sender = User.objects.create_user(username="sender", password="password123")
+        self.recipient = User.objects.create_user(username="recipient", password="password123")
+        self.conversation = Conversation.objects.create()
+        self.conversation.participants.add(self.sender, self.recipient)
+        DeviceToken.objects.create(user=self.recipient, token="recipient-device-token")
+
+    @patch("core.firebase_helpers.send_message_push_notification", return_value=True)
+    def test_message_notification_uses_generic_copy_without_message_preview(self, mock_push):
+        Message.objects.create(
+            conversation=self.conversation,
+            sender=self.sender,
+            content="Conteúdo privado que não pode aparecer na notificação",
+        )
+
+        notification = Notification.objects.get(recipient=self.recipient)
+        self.assertEqual(notification.title, MESSAGE_NOTIFICATION_TITLE)
+        self.assertEqual(notification.body, MESSAGE_NOTIFICATION_BODY)
+        self.assertNotIn("Conteúdo privado", notification.body)
+        self.assertNotIn(self.sender.username, notification.title)
+        mock_push.assert_called_once_with("recipient-device-token")
+
+    def test_message_push_contains_only_its_notification_type(self):
+        with patch("core.firebase_helpers.FIREBASE_INITIALIZED", True), patch(
+            "core.firebase_helpers.messaging.send", return_value="message-id"
+        ) as mock_send:
+            self.assertTrue(send_message_push_notification("recipient-device-token"))
+
+        push_message = mock_send.call_args.args[0]
+        self.assertEqual(push_message.data, {"notification_type": "message"})
+        self.assertIsNone(push_message.notification)
 
 
 class MessageListPaginationTests(APITestCase):
@@ -622,6 +813,11 @@ class EmailVerificationTests(APITestCase):
                 "birth_date": "1990-04-18",
                 "email": email,
                 "password": "SenhaForte!42",
+                "terms_version": CURRENT_TERMS_VERSION,
+                "privacy_version": CURRENT_PRIVACY_VERSION,
+                "accept_terms": True,
+                "accept_privacy": True,
+                "declare_adult": True,
             },
             format="json",
         )
@@ -743,6 +939,11 @@ class BackendValidationTests(APITestCase):
             "birth_date": "1990-04-18",
             "email": "new@example.com",
             "password": "SenhaForte!42",
+            "terms_version": CURRENT_TERMS_VERSION,
+            "privacy_version": CURRENT_PRIVACY_VERSION,
+            "accept_terms": True,
+            "accept_privacy": True,
+            "declare_adult": True,
         }
         payload.update(overrides)
         return self.client.post("/api/register/", payload, format="json")
@@ -772,6 +973,37 @@ class BackendValidationTests(APITestCase):
             format="json",
         )
         self.assertEqual(future.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_create_child_requires_legal_declaration(self):
+        response = self.client.post(
+            "/api/children/",
+            {
+                "conversation_id": self.conversation.id,
+                "name": "Filho",
+                "birth_date": "2020-01-01",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(Child.objects.filter(name="Filho").exists())
+
+        accepted = self.client.post(
+            "/api/children/",
+            {
+                "conversation_id": self.conversation.id,
+                "name": "Filho",
+                "birth_date": "2020-01-01",
+                "declare_legal_responsibility": True,
+            },
+            format="json",
+        )
+
+        self.assertEqual(accepted.status_code, status.HTTP_201_CREATED)
+        child = Child.objects.get(name="Filho")
+        declaration = ChildLegalDeclaration.objects.get(child=child)
+        self.assertEqual(declaration.declared_by, self.user)
+        self.assertIsNotNone(declaration.declared_at)
 
     def test_create_event_invalid_dates_return_400(self):
         payload = {

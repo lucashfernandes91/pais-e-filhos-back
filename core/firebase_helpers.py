@@ -13,6 +13,9 @@ logger = logging.getLogger(__name__)
 # For now, we'll mock the functionality
 FIREBASE_INITIALIZED = False
 
+MESSAGE_NOTIFICATION_TITLE = 'Nova mensagem'
+MESSAGE_NOTIFICATION_BODY = 'Você recebeu uma nova mensagem.'
+
 def initialize_firebase():
     """Initialize Firebase Admin SDK"""
     global FIREBASE_INITIALIZED
@@ -63,6 +66,26 @@ def send_push_notification(device_token, title, body):
         logger.error(f"Failed to send notification: {e}")
         return False
 
+
+def send_message_push_notification(device_token: str) -> bool:
+    """Send a data-only push for a new message without personal content."""
+    if not FIREBASE_INITIALIZED:
+        logger.warning("Firebase not initialized - skipping message notification")
+        return False
+
+    try:
+        message = messaging.Message(
+            data={'notification_type': 'message'},
+            android=messaging.AndroidConfig(priority='high'),
+            token=device_token,
+        )
+        messaging.send(message)
+        logger.info("Message notification sent")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to send message notification: {e}")
+        return False
+
 def send_message_notification(message_obj):
     """
     Send notification when a new message is created
@@ -72,13 +95,11 @@ def send_message_notification(message_obj):
     """
     try:
         conversation = message_obj.conversation
-        sender = message_obj.sender
-
         # Get all participants except sender
-        recipients = conversation.participants.exclude(id=sender.id)
+        recipients = conversation.participants.exclude(id=message_obj.sender_id)
 
-        title = f"Mensagem de {sender.first_name or sender.username}"
-        body = message_obj.content[:100]  # First 100 chars
+        title = MESSAGE_NOTIFICATION_TITLE
+        body = MESSAGE_NOTIFICATION_BODY
 
         # Send notification to each recipient
         for recipient in recipients:
@@ -94,7 +115,7 @@ def send_message_notification(message_obj):
                 # Try to send via Firebase (if available) — B7: todos os aparelhos
                 for device in recipient.device_tokens.all():
                     try:
-                        delivered = send_push_notification(device.token, title, body)
+                        delivered = send_message_push_notification(device.token)
                         if delivered is False and FIREBASE_INITIALIZED:
                             # Token recusado pelo FCM: aparelho desinstalou/expirou.
                             device.delete()

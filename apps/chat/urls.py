@@ -1,6 +1,6 @@
 from django.urls import path
 from .views import (
-    register_user, logout_user, user_profile,
+    register_user, logout_user, user_profile, legal_acceptance,
     send_message, send_message_with_attachment, list_messages, message_detail, mark_message_read,
     create_event, list_events, delete_event, update_event,
     register_device_token, list_notifications,
@@ -19,6 +19,7 @@ urlpatterns = [
     path('register/', register_user),
     path('logout/', logout_user),
     path('profile/', user_profile),
+    path('legal/acceptance/', legal_acceptance),
     path('password-reset/request/', request_password_reset),
     path('password-reset/verify/', verify_password_reset),
     path('password-reset/confirm/', confirm_password_reset),

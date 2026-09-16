@@ -5,7 +5,7 @@ from rest_framework.response import Response
 from django.db import transaction
 from django.http import FileResponse
 from django.utils import timezone
-from .models import Message, Conversation, ConversationInvite, Event, MessageRead, DeviceToken, Notification, Child, EmailVerificationCode, PasswordResetCode, UserProfile
+from .models import Message, Conversation, ConversationInvite, Event, MessageRead, DeviceToken, Notification, Child, ChildLegalDeclaration, EmailVerificationCode, PasswordResetCode, UserProfile, LegalAcceptance
 from .serializers import MessageSerializer, EventSerializer, MessageDetailSerializer, NotificationSerializer, ChildSerializer
 from django.utils import timezone
 from django.core.mail import send_mail
@@ -23,6 +23,7 @@ from datetime import date, datetime, timedelta
 import logging
 import re
 import secrets
+from .legal import CURRENT_CHILD_DECLARATION_VERSION, CURRENT_PRIVACY_VERSION, CURRENT_TERMS_VERSION, current_legal_versions, is_adult
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,31 @@ RESET_CODE_MAX_ATTEMPTS = 5
 RESET_REQUESTS_PER_WINDOW = 3
 
 
+def _is_accepted(value):
+    return value is True or str(value).strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def _validate_legal_acceptance_payload(request):
+    terms_version = str(request.data.get('terms_version', '')).strip()
+    privacy_version = str(request.data.get('privacy_version', '')).strip()
+
+    if terms_version != CURRENT_TERMS_VERSION or privacy_version != CURRENT_PRIVACY_VERSION:
+        return ValidationError('Os documentos legais informados não estão na versão vigente').to_response()
+
+    if not _is_accepted(request.data.get('accept_terms')) or not _is_accepted(request.data.get('accept_privacy')):
+        return ValidationError('É necessário aceitar os Termos de Uso e a Política de Privacidade').to_response()
+
+    return None
+
+
+def _has_current_legal_acceptance(user):
+    return LegalAcceptance.objects.filter(
+        user=user,
+        terms_version=CURRENT_TERMS_VERSION,
+        privacy_version=CURRENT_PRIVACY_VERSION,
+    ).exists()
+
+
 # AUTH
 
 def ensure_user_conversation(user):
@@ -58,10 +84,14 @@ def ensure_user_conversation(user):
 def register_user(request):
     """Register a new user and return JWT tokens."""
     try:
+        legal_error = _validate_legal_acceptance_payload(request)
+        if legal_error:
+            return legal_error
+
         username = request.data.get('username', '').strip()
         first_name = request.data.get('first_name', '').strip()
         last_name = request.data.get('last_name', '').strip()
-        birth_date_value = request.data.get('birth_date', '').strip()
+        birth_date_value = str(request.data.get('birth_date', '')).strip()
         email = request.data.get('email', '').strip()
         password = request.data.get('password', '')
 
@@ -93,6 +123,12 @@ def register_user(request):
         if birth_date > date.today():
             return ValidationError("Data de nascimento n\u00e3o pode estar no futuro").to_response()
 
+        if not is_adult(birth_date):
+            return ValidationError("O cadastro é exclusivo para maiores de 18 anos").to_response()
+
+        if not _is_accepted(request.data.get('declare_adult')):
+            return ValidationError("É necessário declarar que você tem 18 anos ou mais").to_response()
+
         if not password or len(password) < 8:
             return ValidationError("Senha deve ter pelo menos 8 caracteres").to_response()
 
@@ -110,16 +146,23 @@ def register_user(request):
         if User.objects.filter(email__iexact=email).exists():
             return ValidationError("Email j\u00e1 cadastrado").to_response()
 
-        user = User.objects.create_user(
-            username=username,
-            email=email,
-            password=password,
-            first_name=first_name,
-            last_name=last_name,
-        )
-        UserProfile.objects.create(user=user, birth_date=birth_date)
-        conversation = ensure_user_conversation(user)
-        _issue_email_verification(user)
+        with transaction.atomic():
+            user = User.objects.create_user(
+                username=username,
+                email=email,
+                password=password,
+                first_name=first_name,
+                last_name=last_name,
+            )
+            UserProfile.objects.create(user=user, birth_date=birth_date)
+            LegalAcceptance.objects.create(
+                user=user,
+                terms_version=CURRENT_TERMS_VERSION,
+                privacy_version=CURRENT_PRIVACY_VERSION,
+                source='android',
+            )
+            conversation = ensure_user_conversation(user)
+            _issue_email_verification(user)
 
         # Generate tokens
         refresh = RefreshToken.for_user(user)
@@ -134,10 +177,43 @@ def register_user(request):
             'conversation_id': conversation.id,
             'access': str(refresh.access_token),
             'refresh': str(refresh),
+            'legal_acceptance': {
+                **current_legal_versions(),
+                'accepted': True,
+            },
         }, status=201)
 
     except Exception as e:
         return handle_exception(e)
+
+
+@api_view(['GET', 'POST'])
+@permission_classes([IsAuthenticated])
+def legal_acceptance(request):
+    if request.method == 'GET':
+        accepted = _has_current_legal_acceptance(request.user)
+        return Response({
+            **current_legal_versions(),
+            'accepted': accepted,
+            'required': not accepted,
+        })
+
+    legal_error = _validate_legal_acceptance_payload(request)
+    if legal_error:
+        return legal_error
+
+    acceptance, created = LegalAcceptance.objects.get_or_create(
+        user=request.user,
+        terms_version=CURRENT_TERMS_VERSION,
+        privacy_version=CURRENT_PRIVACY_VERSION,
+        defaults={'source': 'android'},
+    )
+    return Response({
+        **current_legal_versions(),
+        'accepted': True,
+        'required': False,
+        'accepted_at': acceptance.accepted_at.isoformat(),
+    }, status=201 if created else 200)
 
 
 @api_view(['GET', 'PUT'])
@@ -794,6 +870,9 @@ def create_child(request):
         if parsed_birth_date > date.today():
             return ValidationError("Data de nascimento não pode estar no futuro").to_response()
 
+        if not _is_accepted(request.data.get('declare_legal_responsibility')):
+            return ValidationError("É necessário declarar que você é pai, mãe ou responsável legal pela criança").to_response()
+
         try:
             conversation = Conversation.objects.get(id=conversation_id)
         except Conversation.DoesNotExist:
@@ -807,9 +886,13 @@ def create_child(request):
             created_by=request.user,
             name=name.strip(),
             birth_date=parsed_birth_date,
-            cpf=request.data.get('cpf', ''),
-            rg=request.data.get('rg', ''),
             has_custody=request.data.get('has_custody', False)
+        )
+        ChildLegalDeclaration.objects.create(
+            child=child,
+            declared_by=request.user,
+            declaration_version=CURRENT_CHILD_DECLARATION_VERSION,
+            source='android',
         )
         serializer = ChildSerializer(child, context={'request': request})
         return Response(serializer.data, status=201)
@@ -851,12 +934,11 @@ def update_child(request, child_id):
             except ValueError:
                 return ValidationError("Data de nascimento inv\u00e1lida").to_response()
 
+        if parsed_birth_date > date.today():
+            return ValidationError("Data de nascimento não pode estar no futuro").to_response()
+
         child.name = name
         child.birth_date = parsed_birth_date
-        if 'cpf' in request.data:
-            child.cpf = request.data.get('cpf') or ''
-        if 'rg' in request.data:
-            child.rg = request.data.get('rg') or ''
         if 'has_custody' in request.data:
             custody_value = request.data.get('has_custody')
             if isinstance(custody_value, bool):

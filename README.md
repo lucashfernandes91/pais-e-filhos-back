@@ -181,7 +181,7 @@ Mensagens com suporte a anexos
 Eventos com tipos: custódia, escola, médico, outro
 
 ### Child
-Informações sobre filhos (CPF, RG, foto, guarda)
+Informações sobre filhos (nome, data de nascimento, foto, guarda)
 
 ### Notification
 Sistema de notificações para dispositivos

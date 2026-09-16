@@ -73,4 +73,4 @@ class ChildSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Child
-        fields = ['id', 'name', 'birth_date', 'cpf', 'rg', 'photo_url', 'has_custody', 'conversation', 'created_by_name', 'created_at']
+        fields = ['id', 'name', 'birth_date', 'photo_url', 'has_custody', 'conversation', 'created_by_name', 'created_at']

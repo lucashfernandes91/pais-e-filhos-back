@@ -1,20 +1,27 @@
 from django.contrib.auth import get_user_model
-from rest_framework import status
-from rest_framework.response import Response
-from rest_framework_simplejwt.views import TokenRefreshView
+from rest_framework_simplejwt.exceptions import InvalidToken
+from rest_framework_simplejwt.serializers import TokenRefreshSerializer
+from rest_framework_simplejwt.settings import api_settings
+from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
+
+from .auth_serializers import EmailOrUsernameTokenObtainPairSerializer
+
+
+class EmailOrUsernameTokenObtainPairView(TokenObtainPairView):
+    serializer_class = EmailOrUsernameTokenObtainPairSerializer
+
+
+class SafeTokenRefreshSerializer(TokenRefreshSerializer):
+    def validate(self, attrs):
+        refresh = self.token_class(attrs["refresh"])
+        user_id = refresh.get(api_settings.USER_ID_CLAIM)
+        lookup = {api_settings.USER_ID_FIELD: user_id}
+
+        if not get_user_model().objects.filter(**lookup).exists():
+            raise InvalidToken("Token is invalid or expired")
+
+        return super().validate(attrs)
 
 
 class SafeTokenRefreshView(TokenRefreshView):
-    """Return an authentication failure when a refresh user was removed."""
-
-    def post(self, request, *args, **kwargs):
-        try:
-            return super().post(request, *args, **kwargs)
-        except get_user_model().DoesNotExist:
-            return Response(
-                {
-                    "detail": "Sessao invalida ou usuario nao encontrado.",
-                    "code": "user_not_found",
-                },
-                status=status.HTTP_401_UNAUTHORIZED,
-            )
+    serializer_class = SafeTokenRefreshSerializer

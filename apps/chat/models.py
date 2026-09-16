@@ -73,6 +73,32 @@ class EmailVerificationCode(models.Model):
         return f"Email verification for {self.user.username}"
 
 
+class LegalAcceptance(models.Model):
+    SOURCE_CHOICES = [
+        ('android', 'Android'),
+        ('web', 'Web'),
+        ('manual', 'Manual'),
+    ]
+
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='legal_acceptances')
+    terms_version = models.CharField(max_length=20)
+    privacy_version = models.CharField(max_length=20)
+    accepted_at = models.DateTimeField(auto_now_add=True)
+    source = models.CharField(max_length=20, choices=SOURCE_CHOICES, default='android')
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['user', 'terms_version', 'privacy_version'],
+                name='unique_user_legal_versions',
+            ),
+        ]
+        ordering = ['-accepted_at']
+
+    def __str__(self):
+        return f"{self.user.username} aceitou {self.terms_version}/{self.privacy_version}"
+
+
 class Message(models.Model):
     conversation = models.ForeignKey(Conversation, on_delete=models.CASCADE)
     sender = models.ForeignKey(User, on_delete=models.CASCADE)
@@ -157,8 +183,6 @@ class Child(models.Model):
     conversation = models.ForeignKey(Conversation, on_delete=models.CASCADE, related_name='children')
     name = models.CharField(max_length=100)
     birth_date = models.DateField()
-    cpf = models.CharField(max_length=14, blank=True, default='')
-    rg = models.CharField(max_length=20, blank=True, default='')
     photo = models.ImageField(upload_to='children_photos/', null=True, blank=True)
     has_custody = models.BooleanField(default=False)
     created_by = models.ForeignKey(User, on_delete=models.CASCADE)
@@ -169,3 +193,23 @@ class Child(models.Model):
 
     def __str__(self):
         return self.name
+
+
+class ChildLegalDeclaration(models.Model):
+    SOURCE_CHOICES = [
+        ('android', 'Android'),
+        ('web', 'Web'),
+        ('manual', 'Manual'),
+    ]
+
+    child = models.OneToOneField(Child, on_delete=models.CASCADE, related_name='legal_declaration')
+    declared_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name='child_legal_declarations')
+    declaration_version = models.CharField(max_length=20)
+    declared_at = models.DateTimeField(auto_now_add=True)
+    source = models.CharField(max_length=20, choices=SOURCE_CHOICES, default='android')
+
+    class Meta:
+        ordering = ['-declared_at']
+
+    def __str__(self):
+        return f"Child declaration {self.child_id} by {self.declared_by.username}"
