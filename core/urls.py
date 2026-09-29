@@ -3,10 +3,12 @@ from django.urls import path, include
 from .auth_views import SafeTokenRefreshView
 from .auth_views import EmailOrUsernameTokenObtainPairView
 from .legal_views import privacy_policy, terms_of_use
+from .account_deletion_views import account_deletion
 
 urlpatterns = [
     path('privacy', privacy_policy, name='privacy-policy'),
     path('terms', terms_of_use, name='terms-of-use'),
+    path('account-deletion', account_deletion, name='account-deletion'),
     path('admin/', admin.site.urls),
     path('api/token/', EmailOrUsernameTokenObtainPairView.as_view()),
     path('api/token/refresh/', SafeTokenRefreshView.as_view()),

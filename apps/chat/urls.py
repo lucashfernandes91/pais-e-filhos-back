@@ -2,7 +2,7 @@ from django.urls import path
 from .views import (
     register_user, logout_user, user_profile, legal_acceptance,
     send_message, send_message_with_attachment, list_messages, message_detail, mark_message_read,
-    create_event, list_events, delete_event, update_event,
+    create_event, list_events, delete_event, update_event, list_event_changes,
     register_device_token, list_notifications,
     mark_all_notifications_read, delete_all_notifications, mark_notification_read, unread_notifications_count,
     export_conversation_pdf,
@@ -49,6 +49,7 @@ urlpatterns = [
     path('events/<int:conversation_id>/', list_events),
     path('events/<int:event_id>/delete/', delete_event),
     path('events/<int:event_id>/update/', update_event),
+    path('event-changes/<int:conversation_id>/', list_event_changes),
 
     # Notifications
     path('device-token/', register_device_token),

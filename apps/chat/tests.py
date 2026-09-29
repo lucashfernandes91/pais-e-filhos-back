@@ -1,6 +1,7 @@
 from django.contrib.auth.models import User
 from django.core import mail
 from django.core.files.uploadedfile import SimpleUploadedFile
+from PIL import Image
 from django.test import SimpleTestCase, override_settings
 from django.utils import timezone
 from rest_framework import status
@@ -8,12 +9,18 @@ from rest_framework.test import APITestCase
 from rest_framework_simplejwt.tokens import RefreshToken
 from unittest.mock import patch
 
-from .models import Child, ChildLegalDeclaration, Conversation, ConversationInvite, DeviceToken, EmailVerificationCode, Event, LegalAcceptance, Message, Notification, PasswordResetCode, UserProfile
+from .models import Child, ChildLegalDeclaration, Conversation, ConversationInvite, DeviceToken, EmailVerificationCode, Event, EventChange, LegalAcceptance, Message, Notification, PasswordResetCode, UserProfile
 from .legal import CURRENT_PRIVACY_VERSION, CURRENT_TERMS_VERSION
-from core.firebase_helpers import MESSAGE_NOTIFICATION_BODY, MESSAGE_NOTIFICATION_TITLE, send_message_push_notification
+from core.firebase_helpers import (
+    MESSAGE_NOTIFICATION_BODY,
+    MESSAGE_NOTIFICATION_TITLE,
+    PushDelivery,
+    send_message_push_notification,
+)
 from datetime import date, timedelta
 import shutil
 import tempfile
+from io import BytesIO
 
 
 class PublicLegalDocumentsTests(SimpleTestCase):
@@ -140,6 +147,50 @@ class ConversationInitializationTests(APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
+    def test_registration_rejects_first_name_with_fewer_than_two_letters(self):
+        response = self.client.post(
+            "/api/register/",
+            {
+                "first_name": "A",
+                "last_name": "Silva",
+                "username": "valid_parent",
+                "birth_date": "1990-04-18",
+                "email": "valid@example.com",
+                "password": "SenhaForte!42",
+                "terms_version": CURRENT_TERMS_VERSION,
+                "privacy_version": CURRENT_PRIVACY_VERSION,
+                "accept_terms": True,
+                "accept_privacy": True,
+                "declare_adult": True,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.data["error"]["message"], "Nome deve ter pelo menos 2 letras")
+
+    def test_registration_rejects_last_name_with_fewer_than_two_letters(self):
+        response = self.client.post(
+            "/api/register/",
+            {
+                "first_name": "Ana",
+                "last_name": "S",
+                "username": "valid_parent",
+                "birth_date": "1990-04-18",
+                "email": "valid@example.com",
+                "password": "SenhaForte!42",
+                "terms_version": CURRENT_TERMS_VERSION,
+                "privacy_version": CURRENT_PRIVACY_VERSION,
+                "accept_terms": True,
+                "accept_privacy": True,
+                "declare_adult": True,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.data["error"]["message"], "Sobrenome deve ter pelo menos 2 letras")
+
     def test_registration_requires_legal_acceptance(self):
         response = self.client.post(
             "/api/register/",
@@ -262,6 +313,7 @@ class ChildUpdateTests(APITestCase):
             name="Clara",
             birth_date="2021-05-26",
             has_custody=True,
+            custody_holder=self.user,
         )
         access_token = str(RefreshToken.for_user(self.user).access_token)
         self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {access_token}")
@@ -282,6 +334,37 @@ class ChildUpdateTests(APITestCase):
         self.assertEqual(self.child.name, "Clara Silva")
         self.assertEqual(self.child.birth_date.isoformat(), "2021-05-27")
         self.assertFalse(self.child.has_custody)
+        self.assertIsNone(self.child.custody_holder)
+
+    def test_patch_child_assigns_custody_to_authenticated_parent(self):
+        other_parent = User.objects.create_user(username="parent_two", password="password123")
+        self.conversation.participants.add(other_parent)
+        other_token = str(RefreshToken.for_user(other_parent).access_token)
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {other_token}")
+
+        response = self.client.patch(
+            f"/api/children/{self.child.id}/update/",
+            {"has_custody": True},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.child.refresh_from_db()
+        self.assertTrue(self.child.has_custody)
+        self.assertEqual(self.child.custody_holder, other_parent)
+        self.assertEqual(response.data["custody_holder_name"], "parent_two")
+
+        original_token = str(RefreshToken.for_user(self.user).access_token)
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {original_token}")
+        self.client.patch(
+            f"/api/children/{self.child.id}/update/",
+            {"has_custody": False},
+            format="json",
+        )
+
+        self.child.refresh_from_db()
+        self.assertTrue(self.child.has_custody)
+        self.assertEqual(self.child.custody_holder, other_parent)
 
     def test_patch_child_rejects_non_participant(self):
         outsider = User.objects.create_user(username="outsider", password="password123")
@@ -385,7 +468,10 @@ class MessageNotificationPrivacyTests(APITestCase):
         self.conversation.participants.add(self.sender, self.recipient)
         DeviceToken.objects.create(user=self.recipient, token="recipient-device-token")
 
-    @patch("core.firebase_helpers.send_message_push_notification", return_value=True)
+    @patch(
+        "core.firebase_helpers.send_message_push_notification",
+        return_value=PushDelivery.DELIVERED,
+    )
     def test_message_notification_uses_generic_copy_without_message_preview(self, mock_push):
         Message.objects.create(
             conversation=self.conversation,
@@ -400,11 +486,42 @@ class MessageNotificationPrivacyTests(APITestCase):
         self.assertNotIn(self.sender.username, notification.title)
         mock_push.assert_called_once_with("recipient-device-token")
 
+    @patch(
+        "core.firebase_helpers.send_message_push_notification",
+        return_value=PushDelivery.FAILED,
+    )
+    def test_message_notification_preserves_token_after_temporary_push_failure(self, mock_push):
+        Message.objects.create(
+            conversation=self.conversation,
+            sender=self.sender,
+            content="Mensagem de teste",
+        )
+
+        self.assertTrue(DeviceToken.objects.filter(token="recipient-device-token").exists())
+        mock_push.assert_called_once_with("recipient-device-token")
+
+    @patch(
+        "core.firebase_helpers.send_message_push_notification",
+        return_value=PushDelivery.INVALID_TOKEN,
+    )
+    def test_message_notification_removes_confirmed_invalid_token(self, mock_push):
+        Message.objects.create(
+            conversation=self.conversation,
+            sender=self.sender,
+            content="Mensagem de teste",
+        )
+
+        self.assertFalse(DeviceToken.objects.filter(token="recipient-device-token").exists())
+        mock_push.assert_called_once_with("recipient-device-token")
+
     def test_message_push_contains_only_its_notification_type(self):
         with patch("core.firebase_helpers.FIREBASE_INITIALIZED", True), patch(
             "core.firebase_helpers.messaging.send", return_value="message-id"
         ) as mock_send:
-            self.assertTrue(send_message_push_notification("recipient-device-token"))
+            self.assertEqual(
+                send_message_push_notification("recipient-device-token"),
+                PushDelivery.DELIVERED,
+            )
 
         push_message = mock_send.call_args.args[0]
         self.assertEqual(push_message.data, {"notification_type": "message"})
@@ -994,6 +1111,7 @@ class BackendValidationTests(APITestCase):
                 "conversation_id": self.conversation.id,
                 "name": "Filho",
                 "birth_date": "2020-01-01",
+                "has_custody": True,
                 "declare_legal_responsibility": True,
             },
             format="json",
@@ -1004,6 +1122,8 @@ class BackendValidationTests(APITestCase):
         declaration = ChildLegalDeclaration.objects.get(child=child)
         self.assertEqual(declaration.declared_by, self.user)
         self.assertIsNotNone(declaration.declared_at)
+        self.assertEqual(child.custody_holder, self.user)
+        self.assertEqual(accepted.data["custody_holder_name"], self.user.username)
 
     def test_create_event_invalid_dates_return_400(self):
         payload = {
@@ -1052,6 +1172,160 @@ class BackendValidationTests(APITestCase):
             format="json",
         )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class EventChangeTests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username='parent_one', email='parent_one@example.com', password='password123'
+        )
+        self.other_parent = User.objects.create_user(
+            username='parent_two', email='parent_two@example.com', password='password123'
+        )
+        self.outsider = User.objects.create_user(
+            username='outsider', email='outsider@example.com', password='password123'
+        )
+        self.conversation = Conversation.objects.create()
+        self.conversation.participants.add(self.user, self.other_parent)
+        self._auth_as(self.user)
+
+    def _auth_as(self, user):
+        token = str(RefreshToken.for_user(user).access_token)
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {token}')
+
+    def _create_event(self):
+        return Event.objects.create(
+            conversation=self.conversation,
+            created_by=self.user,
+            title='Consulta',
+            event_date=timezone.now() + timedelta(days=1),
+            event_type=Event.MEDICAL,
+            notes='Levar exames',
+        )
+
+    def test_create_event_records_creation(self):
+        response = self.client.post(
+            '/api/events/',
+            {
+                'conversation_id': self.conversation.id,
+                'title': 'Reunião escolar',
+                'event_date': '2026-10-05T14:00:00',
+                'event_type': Event.SCHOOL,
+                'notes': '',
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        change = EventChange.objects.get(event_id=response.data['id'])
+        self.assertEqual(change.action, EventChange.CREATED)
+        self.assertEqual(change.actor, self.user)
+        self.assertEqual(change.snapshot['title'], 'Reunião escolar')
+
+    def test_meaningful_update_records_diff_and_increments_version(self):
+        event = self._create_event()
+
+        response = self.client.patch(
+            f'/api/events/{event.id}/update/',
+            {'title': 'Consulta remarcada', 'notes': 'Novo endereço', 'version': event.version},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['version'], 2)
+        change = EventChange.objects.get(event=event, action=EventChange.UPDATED)
+        self.assertEqual(change.actor, self.user)
+        self.assertEqual(change.changes['title']['before'], 'Consulta')
+        self.assertEqual(change.changes['title']['after'], 'Consulta remarcada')
+        self.assertEqual(change.version, 2)
+
+    def test_no_op_update_does_not_create_history(self):
+        event = self._create_event()
+
+        response = self.client.patch(
+            f'/api/events/{event.id}/update/',
+            {'title': event.title, 'version': event.version},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['version'], 1)
+        self.assertFalse(EventChange.objects.filter(event=event).exists())
+
+    def test_stale_version_returns_conflict_without_overwriting(self):
+        event = self._create_event()
+        event.version = 2
+        event.save(update_fields=['version'])
+
+        response = self.client.patch(
+            f'/api/events/{event.id}/update/',
+            {'title': 'Sobrescrita', 'version': 1},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        event.refresh_from_db()
+        self.assertEqual(event.title, 'Consulta')
+        self.assertFalse(EventChange.objects.filter(event=event).exists())
+
+    def test_update_validates_type_range_and_version(self):
+        event = self._create_event()
+        invalid_type = self.client.patch(
+            f'/api/events/{event.id}/update/',
+            {'event_type': 'UNKNOWN', 'version': event.version},
+            format='json',
+        )
+        invalid_range = self.client.patch(
+            f'/api/events/{event.id}/update/',
+            {
+                'event_date': '2026-10-05T14:00:00',
+                'event_date_end': '2026-10-05T13:00:00',
+                'version': event.version,
+            },
+            format='json',
+        )
+        missing_version = self.client.patch(
+            f'/api/events/{event.id}/update/',
+            {'title': 'Sem versão'},
+            format='json',
+        )
+
+        self.assertEqual(invalid_type.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(invalid_range.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(missing_version.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_delete_keeps_immutable_history(self):
+        event = self._create_event()
+        event_id = event.id
+
+        response = self.client.delete(f'/api/events/{event_id}/delete/')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        change = EventChange.objects.get(event_id_snapshot=event_id)
+        self.assertEqual(change.action, EventChange.DELETED)
+        self.assertIsNone(change.event)
+        self.assertEqual(change.snapshot['title'], 'Consulta')
+
+    def test_history_is_available_only_to_participants(self):
+        event = self._create_event()
+        EventChange.objects.create(
+            event=event,
+            event_id_snapshot=event.id,
+            conversation=self.conversation,
+            actor=self.user,
+            action=EventChange.CREATED,
+            event_title=event.title,
+            snapshot={'title': event.title},
+            version=event.version,
+        )
+
+        participant_response = self.client.get(f'/api/event-changes/{self.conversation.id}/')
+        self._auth_as(self.outsider)
+        outsider_response = self.client.get(f'/api/event-changes/{self.conversation.id}/')
+
+        self.assertEqual(participant_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(participant_response.data), 1)
+        self.assertEqual(outsider_response.status_code, status.HTTP_403_FORBIDDEN)
 
 
 class AuthenticatedMediaTests(APITestCase):
@@ -1139,6 +1413,134 @@ class AuthenticatedMediaTests(APITestCase):
     def test_public_media_url_is_gone(self):
         response = self.client.get(f"/media/{self.child.photo.name}")
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+
+class MessageAttachmentValidationTests(APITestCase):
+    def setUp(self):
+        self.media_root = tempfile.mkdtemp()
+        self.override = override_settings(MEDIA_ROOT=self.media_root)
+        self.override.enable()
+        self.addCleanup(self.override.disable)
+        self.addCleanup(shutil.rmtree, self.media_root, True)
+
+        self.user = User.objects.create_user(
+            username="sender",
+            email="sender-attachment@example.com",
+            password="SenhaForte!42",
+        )
+        self.outsider = User.objects.create_user(
+            username="outsider",
+            email="outsider-attachment@example.com",
+            password="SenhaForte!42",
+        )
+        self.conversation = Conversation.objects.create()
+        self.conversation.participants.add(self.user)
+        token = str(RefreshToken.for_user(self.user).access_token)
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {token}")
+
+    def _upload(self, name, content, content_type):
+        return self.client.post(
+            "/api/send-message-attachment/",
+            {
+                "conversation_id": self.conversation.id,
+                "content": "anexo",
+                "attachment": SimpleUploadedFile(name, content, content_type=content_type),
+            },
+            format="multipart",
+        )
+
+    @staticmethod
+    def _valid_png():
+        output = BytesIO()
+        Image.new("RGB", (2, 2), "red").save(output, format="PNG")
+        return output.getvalue()
+
+    def test_accepts_all_allowed_formats(self):
+        files = [
+            ("foto.jpg", "image/jpeg", "JPEG"),
+            ("foto.jpeg", "image/jpeg", "JPEG"),
+            ("foto.png", "image/png", "PNG"),
+            ("foto.webp", "image/webp", "WEBP"),
+        ]
+        for name, content_type, image_format in files:
+            with self.subTest(name=name):
+                output = BytesIO()
+                Image.new("RGB", (2, 2), "red").save(output, format=image_format)
+                response = self._upload(name, output.getvalue(), content_type)
+                self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+        response = self._upload("arquivo.pdf", b"%PDF-1.4\n%%EOF", "application/pdf")
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+    def test_accepts_valid_png_and_generates_uuid_name(self):
+        response = self._upload("foto.png", self._valid_png(), "image/png")
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        message = Message.objects.get(id=response.data["id"])
+        self.assertEqual(message.attachment_type, "image")
+        self.assertRegex(message.attachment.name, r"^attachments/[0-9a-f]{32}\.png$")
+
+    def test_removes_exif_from_processed_image(self):
+        output = BytesIO()
+        exif = Image.Exif()
+        exif[0x010F] = "Phone maker"
+        exif[0x0110] = "Phone model"
+        exif[0x0132] = "2026:09:27 23:30:00"
+        Image.new("RGB", (2, 2), "red").save(output, format="JPEG", exif=exif)
+
+        response = self._upload("foto.jpg", output.getvalue(), "image/jpeg")
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        message = Message.objects.get(id=response.data["id"])
+        with Image.open(message.attachment.path) as cleaned:
+            self.assertFalse(cleaned.getexif())
+            self.assertNotIn("exif", cleaned.info)
+
+    def test_rejects_fake_image_with_valid_extension_and_mime(self):
+        response = self._upload("foto.png", b"not-an-image", "image/png")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(Message.objects.filter(conversation=self.conversation).exists())
+
+    def test_rejects_corrupt_pdf_and_empty_file(self):
+        corrupt = self._upload("arquivo.pdf", b"not-a-pdf", "application/pdf")
+        empty = self._upload("vazio.pdf", b"", "application/pdf")
+
+        self.assertEqual(corrupt.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(empty.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_rejects_size_limit_and_double_extension(self):
+        oversized = self._upload("arquivo.pdf", b"%PDF-" + b"x" * (10 * 1024 * 1024), "application/pdf")
+        double_extension = self._upload("arquivo.backup.pdf", b"%PDF-1.4\n%%EOF", "application/pdf")
+
+        self.assertEqual(oversized.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(double_extension.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_rejects_mime_mismatch(self):
+        response = self._upload("foto.png", self._valid_png(), "application/pdf")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_rejects_user_outside_conversation(self):
+        token = str(RefreshToken.for_user(self.outsider).access_token)
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {token}")
+
+        response = self._upload("arquivo.pdf", b"%PDF-1.4\n%%EOF", "application/pdf")
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_rejects_message_longer_than_2000_characters(self):
+        response = self.client.post(
+            "/api/send-message-attachment/",
+            {
+                "conversation_id": self.conversation.id,
+                "content": "x" * 2001,
+                "attachment": SimpleUploadedFile("arquivo.pdf", b"%PDF-1.4\n%%EOF", content_type="application/pdf"),
+            },
+            format="multipart",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
 
 class ExportPdfTypeTests(APITestCase):

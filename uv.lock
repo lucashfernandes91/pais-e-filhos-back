@@ -657,6 +657,7 @@ dependencies = [
     { name = "djangorestframework" },
     { name = "djangorestframework-simplejwt" },
     { name = "firebase-admin" },
+    { name = "pillow" },
     { name = "psycopg", extra = ["binary"] },
     { name = "reportlab" },
 ]
@@ -671,6 +672,7 @@ requires-dist = [
     { name = "djangorestframework", specifier = ">=3.17.1" },
     { name = "djangorestframework-simplejwt", specifier = ">=5.5.1" },
     { name = "firebase-admin", specifier = ">=6.1.0" },
+    { name = "pillow", specifier = ">=11.0.0" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2.0" },
     { name = "reportlab", specifier = ">=4.0.0" },
 ]

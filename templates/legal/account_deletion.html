@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="robots" content="noindex, nofollow">
+    <title>Excluir conta | CoParent Lite</title>
+    <style>
+        :root {
+            color-scheme: light;
+            font-family: Arial, sans-serif;
+            color: #172033;
+            background: #f5f7fb;
+        }
+        * { box-sizing: border-box; }
+        body { margin: 0; font-size: 16px; line-height: 1.6; }
+        main { max-width: 720px; margin: 0 auto; padding: 32px 16px 56px; }
+        .brand { margin: 0 0 18px; color: #3456a1; font-size: .95rem; font-weight: 700; }
+        article { padding: 28px; background: #fff; border: 1px solid #dce3ed; border-radius: 16px; box-shadow: 0 5px 20px rgba(23, 32, 51, .06); }
+        h1 { margin: 0 0 10px; font-size: clamp(1.7rem, 6vw, 2.25rem); line-height: 1.2; }
+        h2 { margin: 28px 0 8px; font-size: 1.15rem; }
+        p { margin: 10px 0; }
+        .muted { color: #475569; }
+        .notice, .error { margin: 18px 0; padding: 12px 14px; border-radius: 8px; }
+        .notice { color: #174a35; background: #edf8f2; border: 1px solid #b9e1ca; }
+        .error { color: #842029; background: #fff1f2; border: 1px solid #f0b8be; }
+        form { margin-top: 22px; }
+        label { display: block; margin: 14px 0 6px; font-weight: 700; }
+        input[type="email"], input[type="text"], input[type="tel"] {
+            width: 100%; min-height: 48px; padding: 10px 12px; border: 1px solid #8793a5;
+            border-radius: 8px; color: #172033; background: #fff; font: inherit;
+        }
+        input:focus-visible, button:focus-visible, a:focus-visible {
+            outline: 3px solid #4779d0; outline-offset: 3px;
+        }
+        .confirm { display: flex; gap: 10px; align-items: flex-start; margin: 18px 0; font-weight: 400; }
+        .confirm input { width: 20px; height: 20px; margin: 3px 0 0; flex: 0 0 auto; }
+        button {
+            width: 100%; min-height: 48px; padding: 11px 16px; border: 0; border-radius: 8px;
+            color: #fff; background: #9c2636; font: inherit; font-weight: 700; cursor: pointer;
+        }
+        button:hover { background: #81202d; }
+        a { color: #214f9b; }
+        .links { margin-top: 24px; padding-top: 18px; border-top: 1px solid #dce3ed; }
+        .links a + a { margin-left: 16px; }
+        @media (max-width: 480px) {
+            main { padding: 20px 12px 36px; }
+            article { padding: 20px 16px; }
+        }
+    </style>
+</head>
+<body>
+<main>
+    <p class="brand">CoParent Lite</p>
+    <article>
+        {% if stage == 'complete' %}
+            <h1>Pedido confirmado</h1>
+            <p class="notice" role="status">{{ notice }}</p>
+            <p class="muted">Enviamos uma confirmação para o e-mail da conta. Se você não fez este pedido, entre em contato pelo canal de privacidade informado na <a href="/privacy">Política de Privacidade</a>.</p>
+        {% else %}
+            <h1>Solicitar exclusão da conta</h1>
+            <p class="muted">Você pode solicitar a exclusão mesmo sem acesso ao aplicativo. Para proteger sua conta, enviaremos um código ao e-mail cadastrado.</p>
+
+            <h2>O que acontece com os dados</h2>
+            <p>Depois da confirmação, o acesso à conta é bloqueado imediatamente. A conta, o perfil, os dados de crianças cadastrados por ela, fotos, convites e anexos são removidos em até 30 dias. Eventos criados pela conta também são removidos.</p>
+            <p>Mensagens podem permanecer disponíveis para o outro responsável enquanto ele mantiver a conta ativa. Nesse caso, a autoria será exibida como “Conta excluída”; anexos enviados pela conta serão removidos. Registros mínimos de aceite e do pedido podem ser mantidos com acesso restrito.</p>
+            <p class="muted">A exclusão de dados de uma criança cadastrada por esta conta também pode remover a ficha compartilhada com o outro responsável. Consulte a <a href="/privacy">Política de Privacidade</a>.</p>
+            <p class="muted">Sem acesso ao e-mail cadastrado? Você também pode solicitar pelo <a href="https://wa.me/5551992679086?text=Solicito%20a%20exclus%C3%A3o%20da%20minha%20conta%20CoParent%20Lite" target="_blank" rel="noopener noreferrer">canal de privacidade no WhatsApp</a>, com confirmação de identidade.</p>
+
+            {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+            {% if notice %}<p class="notice" role="status">{{ notice }}</p>{% endif %}
+
+            {% if stage == 'verify' %}
+                <p>Informe o código enviado para <strong>{{ masked_email }}</strong>.</p>
+                <form method="post" action="/account-deletion">
+                    {% csrf_token %}
+                    <input type="hidden" name="action" value="confirm">
+                    <input type="hidden" name="email" value="{{ email }}">
+                    <label for="code">Código de confirmação</label>
+                    <input id="code" name="code" type="text" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" required>
+                    <label class="confirm" for="confirm_deletion">
+                        <input id="confirm_deletion" name="confirm_deletion" type="checkbox" value="yes" required>
+                        <span>Confirmo que quero excluir esta conta e entendo os efeitos descritos acima.</span>
+                    </label>
+                    <button type="submit">Confirmar exclusão</button>
+                </form>
+                <p class="muted"><a href="/account-deletion">Voltar e solicitar outro código</a></p>
+            {% else %}
+                <form method="post" action="/account-deletion">
+                    {% csrf_token %}
+                    <input type="hidden" name="action" value="send_code">
+                    <label for="email">E-mail cadastrado na conta</label>
+                    <input id="email" name="email" type="email" autocomplete="email" maxlength="254" required value="{{ email }}">
+                    <button type="submit">Enviar código de confirmação</button>
+                </form>
+            {% endif %}
+        {% endif %}
+
+        <nav class="links" aria-label="Documentos legais">
+            <a href="/privacy">Política de Privacidade</a>
+            <a href="/terms">Termos de Uso</a>
+        </nav>
+    </article>
+</main>
+</body>
+</html>

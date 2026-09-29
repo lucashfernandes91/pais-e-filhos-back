@@ -6,10 +6,11 @@ from django.db import transaction
 from django.conf import settings
 from django.http import FileResponse
 from django.utils import timezone
-from .models import Message, Conversation, ConversationInvite, Event, MessageRead, DeviceToken, Notification, Child, ChildLegalDeclaration, EmailVerificationCode, PasswordResetCode, UserProfile, LegalAcceptance
-from .serializers import MessageSerializer, EventSerializer, MessageDetailSerializer, NotificationSerializer, ChildSerializer
+from .models import Message, Conversation, ConversationInvite, Event, EventChange, MessageRead, DeviceToken, Notification, Child, ChildLegalDeclaration, EmailVerificationCode, PasswordResetCode, UserProfile, LegalAcceptance
+from .serializers import MessageSerializer, EventSerializer, EventChangeSerializer, MessageDetailSerializer, NotificationSerializer, ChildSerializer
 from django.utils import timezone
 from django.core.mail import send_mail
+from django.core.files.storage import default_storage
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.validators import EmailValidator
@@ -24,7 +25,21 @@ from datetime import date, datetime, timedelta
 import logging
 import re
 import secrets
+from pathlib import Path
 from .legal import CURRENT_CHILD_DECLARATION_VERSION, CURRENT_PRIVACY_VERSION, CURRENT_TERMS_VERSION, current_legal_versions, is_adult
+from .attachment_validation import (
+    MAX_ATTACHMENT_SIZE,
+    MAX_MESSAGE_LENGTH,
+    AttachmentValidationError,
+    validate_attachment,
+)
+from .upload_security import (
+    UploadSecurityError,
+    enforce_daily_quota,
+    enforce_upload_rate_limit,
+    scan_with_clamav,
+)
+from .upload_lifecycle import content_sha256, log_upload_result
 
 logger = logging.getLogger(__name__)
 
@@ -97,9 +112,13 @@ def register_user(request):
 
         if not first_name:
             return ValidationError("Nome \u00e9 obrigat\u00f3rio").to_response()
+        if sum(character.isalpha() for character in first_name) < 2:
+            return ValidationError("Nome deve ter pelo menos 2 letras").to_response()
 
         if not last_name:
             return ValidationError("Sobrenome \u00e9 obrigat\u00f3rio").to_response()
+        if sum(character.isalpha() for character in last_name) < 2:
+            return ValidationError("Sobrenome deve ter pelo menos 2 letras").to_response()
 
         if not username or len(username) < 5:
             return ValidationError("Nome de usu\u00e1rio deve ter pelo menos 5 caracteres").to_response()
@@ -272,6 +291,14 @@ def user_profile(request):
         })
 
     except Exception as e:
+        if attachment:
+            log_upload_result(
+                message_id=None,
+                detected_format="unknown",
+                size=getattr(attachment, "size", 0),
+                result="processing_failed",
+                sha256=attachment_hash or "-",
+            )
         return handle_exception(e)
 
 
@@ -591,7 +618,7 @@ def list_conversations(request):
                 participants.append({
                     'id': p.id,
                     'username': p.username,
-                    'is_me': p.id == request.user.id
+                    'is_me': p.id == request.user.id,
                 })
             children = Child.objects.filter(conversation=conv)
             children_data = ChildSerializer(children, many=True, context={'request': request}).data
@@ -708,7 +735,11 @@ def accept_invite(request):
                     solo.delete()
 
         participants = [
-            {'id': p.id, 'username': p.username, 'is_me': p.id == request.user.id}
+            {
+                'id': p.id,
+                'username': p.username,
+                'is_me': p.id == request.user.id,
+            }
             for p in conversation.participants.all()
         ]
         return Response({
@@ -773,14 +804,16 @@ def send_message_with_attachment(request):
     """Send a message with a file attachment (image/document)."""
     try:
         conversation_id = request.data.get('conversation_id')
-        content = request.data.get('content', '')
         attachment = request.FILES.get('attachment')
+        content = request.data.get('content', '') or ''
 
         if not conversation_id:
             return ValidationError("conversation_id Ã© obrigatÃ³rio").to_response()
 
         if not content and not attachment:
             return ValidationError("Mensagem ou anexo Ã© obrigatÃ³rio").to_response()
+        if len(content) > MAX_MESSAGE_LENGTH:
+            return ValidationError("A mensagem deve ter no máximo 2000 caracteres.").to_response()
 
         try:
             conversation = Conversation.objects.get(id=conversation_id)
@@ -790,31 +823,75 @@ def send_message_with_attachment(request):
         if not conversation.participants.filter(id=request.user.id).exists():
             return ForbiddenError("VocÃª nÃ£o faz parte dessa conversa").to_response()
 
-        # Determine attachment type
+        try:
+            enforce_upload_rate_limit(
+                request.user.id,
+                request.META.get('REMOTE_ADDR') or request.META.get('HTTP_X_FORWARDED_FOR', '').split(',')[0].strip(),
+            )
+        except UploadSecurityError as exc:
+            return ValidationError(str(exc)).to_response()
+
         attachment_type = ''
+        content_file = None
+        attachment_size = 0
+        attachment_hash = ''
         if attachment:
-            content_type = attachment.content_type or ''
-            if content_type.startswith('image/'):
-                attachment_type = 'image'
-            elif content_type == 'application/pdf':
-                attachment_type = 'pdf'
-            else:
-                attachment_type = 'document'
+            try:
+                if attachment.size > MAX_ATTACHMENT_SIZE:
+                    raise AttachmentValidationError("Arquivo muito grande (máximo 10 MB).")
+                content_file, attachment_type = validate_attachment(
+                    attachment,
+                    attachment.read(),
+                )
+                attachment_size = content_file.size
+                enforce_daily_quota(request.user.id, attachment_size)
+                clean_content = content_file.read()
+                attachment_hash = content_sha256(clean_content)
+                scan_with_clamav(clean_content)
+                content_file.seek(0)
+            except UploadSecurityError as exc:
+                log_upload_result(
+                    message_id=None,
+                    detected_format=attachment_type,
+                    size=attachment.size,
+                    result="rejected",
+                    sha256=attachment_hash or "-",
+                )
+                return ValidationError(str(exc)).to_response()
+            except AttachmentValidationError as exc:
+                log_upload_result(
+                    message_id=None,
+                    detected_format="unknown",
+                    size=attachment.size,
+                    result="rejected",
+                    sha256="-",
+                )
+                return ValidationError(str(exc)).to_response()
 
-            # Limit file size (10MB)
-            if attachment.size > 10 * 1024 * 1024:
-                return ValidationError("Arquivo muito grande (mÃ¡x 10MB)").to_response()
-
-        message = Message.objects.create(
-            conversation=conversation,
-            sender=request.user,
-            content=content,
-            attachment=attachment,
-            attachment_type=attachment_type
-        )
-
-        serializer = MessageSerializer(message, context={'request': request})
-        return Response(serializer.data, status=201)
+        try:
+            message = Message.objects.create(
+                conversation=conversation,
+                sender=request.user,
+                content=content,
+                attachment=content_file,
+                attachment_type=attachment_type,
+                attachment_size=attachment_size,
+                attachment_sha256=attachment_hash,
+                attachment_status=Message.ATTACHMENT_APPROVED,
+            )
+            log_upload_result(
+                message_id=message.id,
+                detected_format=attachment_type,
+                size=attachment_size,
+                result="approved",
+                sha256=message.attachment_sha256,
+            )
+            serializer = MessageSerializer(message, context={'request': request})
+            return Response(serializer.data, status=201)
+        except Exception:
+            if content_file and content_file.name:
+                default_storage.delete(content_file.name)
+            raise
 
     except Exception as e:
         return handle_exception(e)
@@ -881,12 +958,14 @@ def create_child(request):
         if not conversation.participants.filter(id=request.user.id).exists():
             return ForbiddenError("Você não faz parte dessa conversa").to_response()
 
+        has_custody = _is_accepted(request.data.get('has_custody', False))
         child = Child.objects.create(
             conversation=conversation,
             created_by=request.user,
             name=name.strip(),
             birth_date=parsed_birth_date,
-            has_custody=request.data.get('has_custody', False)
+            has_custody=has_custody,
+            custody_holder=request.user if has_custody else None,
         )
         ChildLegalDeclaration.objects.create(
             child=child,
@@ -942,13 +1021,20 @@ def update_child(request, child_id):
         if 'has_custody' in request.data:
             custody_value = request.data.get('has_custody')
             if isinstance(custody_value, bool):
-                child.has_custody = custody_value
+                parsed_custody = custody_value
             elif str(custody_value).lower() in ('true', '1'):
-                child.has_custody = True
+                parsed_custody = True
             elif str(custody_value).lower() in ('false', '0'):
-                child.has_custody = False
+                parsed_custody = False
             else:
                 return ValidationError("Valor de guarda inv\u00e1lido").to_response()
+
+            if parsed_custody:
+                child.has_custody = True
+                child.custody_holder = request.user
+            elif child.custody_holder_id in (None, request.user.id):
+                child.has_custody = False
+                child.custody_holder = None
 
         photo = request.FILES.get('photo')
         if photo is not None:
@@ -1080,6 +1166,71 @@ def mark_message_read(request, message_id):
 
 # EVENTS
 
+EVENT_EDITABLE_FIELDS = ('title', 'event_date', 'event_date_end', 'event_type', 'notes')
+EVENT_NOTES_MAX_LENGTH = 5000
+
+
+def _event_snapshot(event):
+    return {
+        'title': event.title,
+        'event_date': event.event_date.isoformat() if event.event_date else None,
+        'event_date_end': event.event_date_end.isoformat() if event.event_date_end else None,
+        'event_type': event.event_type,
+        'notes': event.notes,
+    }
+
+
+def _record_event_change(event, actor, action, changes=None):
+    return EventChange.objects.create(
+        event=event,
+        event_id_snapshot=event.id,
+        conversation=event.conversation,
+        actor=actor,
+        action=action,
+        event_title=event.title,
+        changes=changes or {},
+        snapshot=_event_snapshot(event),
+        version=event.version,
+    )
+
+
+def _validate_event_values(title, event_date, event_date_end, event_type, notes):
+    clean_title = str(title or '').strip()
+    if not clean_title:
+        return None, ValidationError("Título do evento é obrigatório").to_response()
+    if len(clean_title) > 255:
+        return None, ValidationError("Título muito longo (máx. 255 caracteres)").to_response()
+
+    clean_type = str(event_type or '').strip().upper()
+    if clean_type not in dict(Event.TYPE_CHOICES):
+        return None, ValidationError("Tipo de evento inválido").to_response()
+
+    clean_notes = str(notes or '').strip()
+    if len(clean_notes) > EVENT_NOTES_MAX_LENGTH:
+        return None, ValidationError("Notas muito longas (máx. 5000 caracteres)").to_response()
+
+    if event_date is None:
+        return None, ValidationError("Data do evento é obrigatória").to_response()
+    parsed_start = event_date if isinstance(event_date, datetime) else _parse_event_datetime(event_date)
+    if parsed_start is None:
+        return None, ValidationError("Data do evento inválida").to_response()
+
+    parsed_end = None
+    if event_date_end not in (None, ''):
+        parsed_end = event_date_end if isinstance(event_date_end, datetime) else _parse_event_datetime(event_date_end)
+        if parsed_end is None:
+            return None, ValidationError("Data de fim do evento inválida").to_response()
+        if parsed_end <= parsed_start:
+            return None, ValidationError("A data de fim deve ser após o início").to_response()
+
+    return {
+        'title': clean_title,
+        'event_date': parsed_start,
+        'event_date_end': parsed_end,
+        'event_type': clean_type,
+        'notes': clean_notes,
+    }, None
+
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def create_event(request):
@@ -1090,31 +1241,14 @@ def create_event(request):
         event_type = request.data.get('event_type')
         notes = request.data.get('notes', '')
         event_date_end = request.data.get('event_date_end', None)
-        # Validate input
         if not conversation_id:
-            return ValidationError("conversation_id Ã© obrigatÃ³rio").to_response()
+            return ValidationError("conversation_id é obrigatório").to_response()
 
-        if not title or len(title.strip()) == 0:
-            return ValidationError("TÃ­tulo do evento Ã© obrigatÃ³rio").to_response()
-
-        if len(title) > 255:
-            return ValidationError("TÃ­tulo muito longo (mÃ¡x 255 caracteres)").to_response()
-
-        if not event_date:
-            return ValidationError("Data do evento é obrigatória").to_response()
-
-        if not event_type:
-            return ValidationError("Tipo de evento é obrigatório").to_response()
-
-        parsed_event_date = _parse_event_datetime(event_date)
-        if parsed_event_date is None:
-            return ValidationError("Data do evento inválida").to_response()
-
-        parsed_event_date_end = None
-        if event_date_end:
-            parsed_event_date_end = _parse_event_datetime(event_date_end)
-            if parsed_event_date_end is None:
-                return ValidationError("Data de fim do evento inválida").to_response()
+        values, error_response = _validate_event_values(
+            title, event_date, event_date_end, event_type, notes
+        )
+        if error_response:
+            return error_response
 
         # Verify conversation exists
         try:
@@ -1126,16 +1260,13 @@ def create_event(request):
         if not conversation.participants.filter(id=request.user.id).exists():
             return ForbiddenError("Você não faz parte dessa conversa").to_response()
 
-        # Create event
-        event = Event.objects.create(
-            conversation=conversation,
-            created_by=request.user,
-            title=title.strip(),
-            event_date=parsed_event_date,
-            event_date_end=parsed_event_date_end,
-            event_type=event_type,
-            notes=notes
-        )
+        with transaction.atomic():
+            event = Event.objects.create(
+                conversation=conversation,
+                created_by=request.user,
+                **values,
+            )
+            _record_event_change(event, request.user, EventChange.CREATED)
         serializer = EventSerializer(event)
         return Response(serializer.data, status=201)
 
@@ -1171,68 +1302,104 @@ def list_events(request, conversation_id):
 def delete_event(request, event_id):
     try:
         # Verify event exists
-        try:
-            event = Event.objects.get(id=event_id)
-        except Event.DoesNotExist:
-            return NotFoundError("Evento").to_response()
+        with transaction.atomic():
+            try:
+                event = Event.objects.select_for_update().get(id=event_id)
+            except Event.DoesNotExist:
+                return NotFoundError("Evento").to_response()
 
-        # Check authorization: qualquer participante da conversa pode excluir
-        if not event.conversation.participants.filter(id=request.user.id).exists():
-            return ForbiddenError("VocÃª nÃ£o faz parte dessa conversa").to_response()
+            if not event.conversation.participants.filter(id=request.user.id).exists():
+                return ForbiddenError("Você não faz parte dessa conversa").to_response()
 
-        # Delete event
-        event.delete()
+            _record_event_change(event, request.user, EventChange.DELETED)
+            event.delete()
         return Response({'status': 'ok'})
 
     except Exception as e:
         return handle_exception(e)
 
 
-@api_view(['PUT'])
+@api_view(['PUT', 'PATCH'])
 @permission_classes([IsAuthenticated])
 def update_event(request, event_id):
-    """Update an existing event."""
     try:
-        try:
-            event = Event.objects.get(id=event_id)
-        except Event.DoesNotExist:
-            return NotFoundError("Evento").to_response()
+        with transaction.atomic():
+            try:
+                event = Event.objects.select_for_update().get(id=event_id)
+            except Event.DoesNotExist:
+                return NotFoundError("Evento").to_response()
 
-        if not event.conversation.participants.filter(id=request.user.id).exists():
-            return ForbiddenError("Voc\u00ea n\u00e3o faz parte dessa conversa").to_response()
+            if not event.conversation.participants.filter(id=request.user.id).exists():
+                return ForbiddenError("Você não faz parte dessa conversa").to_response()
 
-        title = request.data.get('title', event.title)
-        event_date = request.data.get('event_date', None)
-        event_date_end = request.data.get('event_date_end', event.event_date_end)
-        event_type = request.data.get('event_type', event.event_type)
-        notes = request.data.get('notes', event.notes)
+            values, error_response = _validate_event_values(
+                request.data.get('title', event.title),
+                request.data.get('event_date', event.event_date),
+                request.data.get('event_date_end', event.event_date_end),
+                request.data.get('event_type', event.event_type),
+                request.data.get('notes', event.notes),
+            )
+            if error_response:
+                return error_response
 
-        if title and len(title.strip()) == 0:
-            return ValidationError("T\u00edtulo n\u00e3o pode estar vazio").to_response()
+            requested_version = request.data.get('version')
+            if requested_version is None:
+                return ValidationError("A versão do evento é obrigatória").to_response()
+            try:
+                requested_version = int(requested_version)
+            except (TypeError, ValueError):
+                return ValidationError("Versão do evento inválida").to_response()
+            if requested_version != event.version:
+                return Response(
+                    {
+                        'error': {
+                            'code': 'EVENT_VERSION_CONFLICT',
+                            'message': 'Este evento foi atualizado por outro responsável.',
+                        },
+                        'current_version': event.version,
+                    },
+                    status=409,
+                )
 
-        parsed_event_date = None
-        if event_date:
-            parsed_event_date = _parse_event_datetime(event_date)
-            if parsed_event_date is None:
-                return ValidationError("Data do evento inv\u00e1lida").to_response()
+            before = _event_snapshot(event)
+            after = {
+                key: value.isoformat() if isinstance(value, datetime) else value
+                for key, value in values.items()
+            }
+            changes = {
+                key: {'before': before[key], 'after': after[key]}
+                for key in EVENT_EDITABLE_FIELDS
+                if before[key] != after[key]
+            }
 
-        parsed_event_date_end = event_date_end
-        if event_date_end and not isinstance(event_date_end, datetime):
-            parsed_event_date_end = _parse_event_datetime(event_date_end)
-            if parsed_event_date_end is None:
-                return ValidationError("Data de fim do evento inv\u00e1lida").to_response()
-
-        event.title = title.strip() if title else event.title
-        if parsed_event_date:
-            event.event_date = parsed_event_date
-        event.event_date_end = parsed_event_date_end
-        event.event_type = event_type
-        event.notes = notes
-        event.save()
+            if changes:
+                for key, value in values.items():
+                    setattr(event, key, value)
+                event.version += 1
+                event.save()
+                _record_event_change(event, request.user, EventChange.UPDATED, changes)
 
         serializer = EventSerializer(event)
         return Response(serializer.data)
 
+    except Exception as e:
+        return handle_exception(e)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def list_event_changes(request, conversation_id):
+    try:
+        try:
+            conversation = Conversation.objects.get(id=conversation_id)
+        except Conversation.DoesNotExist:
+            return NotFoundError("Conversa").to_response()
+
+        if not conversation.participants.filter(id=request.user.id).exists():
+            return ForbiddenError("Você não faz parte dessa conversa").to_response()
+
+        changes = EventChange.objects.filter(conversation=conversation).select_related('actor')[:200]
+        return Response(EventChangeSerializer(changes, many=True).data)
     except Exception as e:
         return handle_exception(e)
 
@@ -1400,8 +1567,17 @@ def serve_message_attachment(request, message_id):
 
         if not message.attachment:
             return NotFoundError("Anexo").to_response()
+        if message.attachment_status != Message.ATTACHMENT_APPROVED:
+            return NotFoundError("Anexo").to_response()
 
-        return FileResponse(message.attachment.open('rb'))
+        response = FileResponse(
+            message.attachment.open('rb'),
+            as_attachment=True,
+            filename=Path(message.attachment.name).name,
+        )
+        response["X-Content-Type-Options"] = "nosniff"
+        response["Content-Disposition"] = f'attachment; filename="{Path(message.attachment.name).name}"'
+        return response
 
     except Exception as e:
         return handle_exception(e)
