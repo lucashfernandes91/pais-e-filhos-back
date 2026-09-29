@@ -2,6 +2,7 @@
 Centralized error handling for CoParent API
 """
 
+from django.core.exceptions import ValidationError as DjangoValidationError
 from rest_framework.response import Response
 from rest_framework import status
 import logging
@@ -50,30 +51,12 @@ class NotFoundError(ApiError):
         )
 
 
-class UnauthorizedError(ApiError):
-    def __init__(self, message: str = "Não autorizado"):
-        super().__init__(
-            code='UNAUTHORIZED',
-            message=message,
-            status_code=status.HTTP_401_UNAUTHORIZED
-        )
-
-
 class ForbiddenError(ApiError):
     def __init__(self, message: str = "Acesso negado"):
         super().__init__(
             code='FORBIDDEN',
             message=message,
             status_code=status.HTTP_403_FORBIDDEN
-        )
-
-
-class ConflictError(ApiError):
-    def __init__(self, message: str = "Conflito de dados"):
-        super().__init__(
-            code='CONFLICT',
-            message=message,
-            status_code=status.HTTP_409_CONFLICT
         )
 
 
@@ -101,6 +84,9 @@ def handle_exception(exception: Exception):
 
     if isinstance(exception, ValueError):
         return ValidationError(str(exception)).to_response()
+    elif isinstance(exception, DjangoValidationError):
+        messages = getattr(exception, 'messages', None) or [str(exception)]
+        return ValidationError(" ".join(messages)).to_response()
     elif isinstance(exception, PermissionError):
         return ForbiddenError().to_response()
     else:

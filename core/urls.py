@@ -1,16 +1,19 @@
 from django.contrib import admin
 from django.urls import path, include
-from django.conf import settings
-from django.conf.urls.static import static
-from rest_framework_simplejwt.views import TokenObtainPairView
 from .auth_views import SafeTokenRefreshView
+from .auth_views import EmailOrUsernameTokenObtainPairView
+from .legal_views import privacy_policy, terms_of_use
+from .account_deletion_views import account_deletion
 
 urlpatterns = [
+    path('privacy', privacy_policy, name='privacy-policy'),
+    path('terms', terms_of_use, name='terms-of-use'),
+    path('account-deletion', account_deletion, name='account-deletion'),
     path('admin/', admin.site.urls),
-    path('api/token/', TokenObtainPairView.as_view()),
+    path('api/token/', EmailOrUsernameTokenObtainPairView.as_view()),
     path('api/token/refresh/', SafeTokenRefreshView.as_view()),
     path('api/', include('apps.chat.urls')),
 ]
 
-if settings.DEBUG:
-    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+# B2: /media/ não é mais servido publicamente — anexos e fotos saem
+# pelos endpoints autenticados em apps/chat (api/media/...), em dev e em prod.

@@ -6,6 +6,7 @@ import firebase_admin
 from firebase_admin import credentials, messaging
 import os
 import logging
+from enum import Enum
 
 logger = logging.getLogger(__name__)
 
@@ -13,11 +14,29 @@ logger = logging.getLogger(__name__)
 # For now, we'll mock the functionality
 FIREBASE_INITIALIZED = False
 
+MESSAGE_NOTIFICATION_TITLE = 'Nova mensagem'
+MESSAGE_NOTIFICATION_BODY = 'Você recebeu uma nova mensagem.'
+
+
+class PushDelivery(Enum):
+    DELIVERED = 'delivered'
+    INVALID_TOKEN = 'invalid_token'
+    FAILED = 'failed'
+
+
 def initialize_firebase():
     """Initialize Firebase Admin SDK"""
     global FIREBASE_INITIALIZED
 
     try:
+        try:
+            firebase_admin.get_app()
+            FIREBASE_INITIALIZED = True
+            logger.info("Firebase already initialized")
+            return
+        except ValueError:
+            pass
+
         # Try to load service account key
         cred_path = os.getenv('FIREBASE_CREDENTIALS_PATH', None)
         if cred_path and os.path.exists(cred_path):
@@ -32,7 +51,7 @@ def initialize_firebase():
         logger.error(f"Failed to initialize Firebase: {e}")
         FIREBASE_INITIALIZED = False
 
-def send_push_notification(device_token, title, body):
+def send_push_notification(device_token, title, body) -> PushDelivery:
     """
     Send push notification via Firebase Cloud Messaging
 
@@ -42,11 +61,11 @@ def send_push_notification(device_token, title, body):
         body: Notification body
 
     Returns:
-        bool: Success status
+        PushDelivery: result of the delivery attempt
     """
     if not FIREBASE_INITIALIZED:
-        logger.warning(f"Firebase not initialized - skipping notification to {device_token}")
-        return False
+        logger.warning("Firebase not initialized - skipping notification")
+        return PushDelivery.FAILED
 
     try:
         message = messaging.Message(
@@ -58,10 +77,36 @@ def send_push_notification(device_token, title, body):
         )
         response = messaging.send(message)
         logger.info(f"Notification sent: {response}")
-        return True
+        return PushDelivery.DELIVERED
+    except messaging.UnregisteredError:
+        logger.info("FCM token is no longer registered")
+        return PushDelivery.INVALID_TOKEN
     except Exception as e:
         logger.error(f"Failed to send notification: {e}")
-        return False
+        return PushDelivery.FAILED
+
+
+def send_message_push_notification(device_token: str) -> PushDelivery:
+    """Send a data-only push for a new message without personal content."""
+    if not FIREBASE_INITIALIZED:
+        logger.warning("Firebase not initialized - skipping message notification")
+        return PushDelivery.FAILED
+
+    try:
+        message = messaging.Message(
+            data={'notification_type': 'message'},
+            android=messaging.AndroidConfig(priority='high'),
+            token=device_token,
+        )
+        messaging.send(message)
+        logger.info("Message notification sent")
+        return PushDelivery.DELIVERED
+    except messaging.UnregisteredError:
+        logger.info("FCM token is no longer registered")
+        return PushDelivery.INVALID_TOKEN
+    except Exception as e:
+        logger.error(f"Failed to send message notification: {e}")
+        return PushDelivery.FAILED
 
 def send_message_notification(message_obj):
     """
@@ -72,13 +117,11 @@ def send_message_notification(message_obj):
     """
     try:
         conversation = message_obj.conversation
-        sender = message_obj.sender
-
         # Get all participants except sender
-        recipients = conversation.participants.exclude(id=sender.id)
+        recipients = conversation.participants.exclude(id=message_obj.sender_id)
 
-        title = f"Mensagem de {sender.first_name or sender.username}"
-        body = message_obj.content[:100]  # First 100 chars
+        title = MESSAGE_NOTIFICATION_TITLE
+        body = MESSAGE_NOTIFICATION_BODY
 
         # Send notification to each recipient
         for recipient in recipients:
@@ -91,12 +134,16 @@ def send_message_notification(message_obj):
                     body=body
                 )
 
-                # Try to send via Firebase (if available)
-                try:
-                    device_token = recipient.device_token.token
-                    send_push_notification(device_token, title, body)
-                except Exception as e:
-                    logger.debug(f"Firebase push for {recipient.username} failed: {e}")
+                # Try to send via Firebase (if available) — B7: todos os aparelhos
+                for device in recipient.device_tokens.all():
+                    try:
+                        delivered = send_message_push_notification(device.token)
+                        if delivered is PushDelivery.INVALID_TOKEN:
+                            device.delete()
+                        elif delivered is PushDelivery.FAILED:
+                            logger.warning("Message push failed; preserving device token for retry")
+                    except Exception as e:
+                        logger.debug(f"Firebase push for {recipient.username} failed: {e}")
             except Exception as e:
                 logger.warning(f"Could not create notification for {recipient.username}: {e}")
 
@@ -131,12 +178,16 @@ def send_event_notification(event_obj):
                     body=body
                 )
 
-                # Try to send via Firebase (if available)
-                try:
-                    device_token = recipient.device_token.token
-                    send_push_notification(device_token, title, body)
-                except Exception as e:
-                    logger.debug(f"Firebase push for {recipient.username} failed: {e}")
+                # Try to send via Firebase (if available) — B7: todos os aparelhos
+                for device in recipient.device_tokens.all():
+                    try:
+                        delivered = send_push_notification(device.token, title, body)
+                        if delivered is PushDelivery.INVALID_TOKEN:
+                            device.delete()
+                        elif delivered is PushDelivery.FAILED:
+                            logger.warning("Event push failed; preserving device token for retry")
+                    except Exception as e:
+                        logger.debug(f"Firebase push for {recipient.username} failed: {e}")
             except Exception as e:
                 logger.warning(f"Could not create event notification for {recipient.username}: {e}")
 

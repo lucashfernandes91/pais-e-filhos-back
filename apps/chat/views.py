@@ -2,16 +2,86 @@
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from rest_framework.response import Response
+from django.db import transaction
+from django.conf import settings
 from django.http import FileResponse
 from django.utils import timezone
-from .models import Message, Conversation, Event, MessageRead, DeviceToken, Notification, Child, UserProfile
-from .serializers import MessageSerializer, EventSerializer, MessageDetailSerializer, DeviceTokenSerializer, NotificationSerializer, ChildSerializer
+from .models import Message, Conversation, ConversationInvite, Event, EventChange, MessageRead, DeviceToken, Notification, Child, ChildLegalDeclaration, EmailVerificationCode, PasswordResetCode, UserProfile, LegalAcceptance
+from .serializers import MessageSerializer, EventSerializer, EventChangeSerializer, MessageDetailSerializer, NotificationSerializer, ChildSerializer
 from django.utils import timezone
+from django.core.mail import send_mail
+from django.core.files.storage import default_storage
+from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.core.validators import EmailValidator
 from core.pdf_generator import generate_conversation_pdf
-from core.error_handler import ValidationError, NotFoundError, ForbiddenError, ServerError, handle_exception
+from core.error_handler import ValidationError, NotFoundError, ForbiddenError, RateLimitError, handle_exception
 from django.contrib.auth.models import User
 from rest_framework_simplejwt.tokens import RefreshToken
-from datetime import date
+from rest_framework_simplejwt.exceptions import TokenError
+from rest_framework_simplejwt.token_blacklist.models import OutstandingToken, BlacklistedToken
+from django.utils.dateparse import parse_datetime, parse_date
+from datetime import date, datetime, timedelta
+import logging
+import re
+import secrets
+from pathlib import Path
+from .legal import CURRENT_CHILD_DECLARATION_VERSION, CURRENT_PRIVACY_VERSION, CURRENT_TERMS_VERSION, current_legal_versions, is_adult
+from .attachment_validation import (
+    MAX_ATTACHMENT_SIZE,
+    MAX_MESSAGE_LENGTH,
+    AttachmentValidationError,
+    validate_attachment,
+)
+from .upload_security import (
+    UploadSecurityError,
+    enforce_daily_quota,
+    enforce_upload_rate_limit,
+    scan_with_clamav,
+)
+from .upload_lifecycle import content_sha256, log_upload_result
+
+logger = logging.getLogger(__name__)
+
+# Regras de negócio do convite (decisões de 2026-07-16):
+# conversa 1:1, código expira em 7 dias, novo código invalida o anterior.
+MAX_CONVERSATION_PARTICIPANTS = 2
+INVITE_TTL_DAYS = 7
+INVITE_CODE_LENGTH = 8
+# Sem 0/O/1/I/L para o código sobreviver a ditado por telefone.
+INVITE_CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'
+
+# Códigos por e-mail — reset de senha e confirmação de e-mail compartilham
+# as regras (decisões de 2026-07-16): 6 dígitos, 15 minutos, 5 tentativas,
+# 3 pedidos por janela.
+RESET_CODE_TTL_MINUTES = 15
+RESET_CODE_MAX_ATTEMPTS = 5
+RESET_REQUESTS_PER_WINDOW = 3
+
+
+def _is_accepted(value):
+    return value is True or str(value).strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def _validate_legal_acceptance_payload(request):
+    terms_version = str(request.data.get('terms_version', '')).strip()
+    privacy_version = str(request.data.get('privacy_version', '')).strip()
+
+    if terms_version != CURRENT_TERMS_VERSION or privacy_version != CURRENT_PRIVACY_VERSION:
+        return ValidationError('Os documentos legais informados não estão na versão vigente').to_response()
+
+    if not _is_accepted(request.data.get('accept_terms')) or not _is_accepted(request.data.get('accept_privacy')):
+        return ValidationError('É necessário aceitar os Termos de Uso e a Política de Privacidade').to_response()
+
+    return None
+
+
+def _has_current_legal_acceptance(user):
+    return LegalAcceptance.objects.filter(
+        user=user,
+        terms_version=CURRENT_TERMS_VERSION,
+        privacy_version=CURRENT_PRIVACY_VERSION,
+    ).exists()
 
 
 # AUTH
@@ -29,24 +99,40 @@ def ensure_user_conversation(user):
 def register_user(request):
     """Register a new user and return JWT tokens."""
     try:
+        legal_error = _validate_legal_acceptance_payload(request)
+        if legal_error:
+            return legal_error
+
         username = request.data.get('username', '').strip()
         first_name = request.data.get('first_name', '').strip()
         last_name = request.data.get('last_name', '').strip()
-        birth_date_value = request.data.get('birth_date', '').strip()
+        birth_date_value = str(request.data.get('birth_date', '')).strip()
         email = request.data.get('email', '').strip()
         password = request.data.get('password', '')
 
         if not first_name:
             return ValidationError("Nome \u00e9 obrigat\u00f3rio").to_response()
+        if sum(character.isalpha() for character in first_name) < 2:
+            return ValidationError("Nome deve ter pelo menos 2 letras").to_response()
 
         if not last_name:
             return ValidationError("Sobrenome \u00e9 obrigat\u00f3rio").to_response()
+        if sum(character.isalpha() for character in last_name) < 2:
+            return ValidationError("Sobrenome deve ter pelo menos 2 letras").to_response()
 
         if not username or len(username) < 5:
             return ValidationError("Nome de usu\u00e1rio deve ter pelo menos 5 caracteres").to_response()
 
+        if not re.fullmatch(r'[a-zA-Z0-9._]+', username):
+            return ValidationError("Nome de usu\u00e1rio: use apenas letras, n\u00fameros, . ou _").to_response()
+
         if not email:
             return ValidationError("Email \u00e9 obrigat\u00f3rio").to_response()
+
+        try:
+            EmailValidator()(email)
+        except DjangoValidationError:
+            return ValidationError("Email inv\u00e1lido").to_response()
 
         try:
             birth_date = date.fromisoformat(birth_date_value)
@@ -56,24 +142,46 @@ def register_user(request):
         if birth_date > date.today():
             return ValidationError("Data de nascimento n\u00e3o pode estar no futuro").to_response()
 
+        if not is_adult(birth_date):
+            return ValidationError("O cadastro é exclusivo para maiores de 18 anos").to_response()
+
+        if not _is_accepted(request.data.get('declare_adult')):
+            return ValidationError("É necessário declarar que você tem 18 anos ou mais").to_response()
+
         if not password or len(password) < 8:
             return ValidationError("Senha deve ter pelo menos 8 caracteres").to_response()
+
+        try:
+            validate_password(password, user=User(
+                username=username, email=email,
+                first_name=first_name, last_name=last_name,
+            ))
+        except DjangoValidationError as e:
+            return ValidationError(" ".join(e.messages)).to_response()
 
         if User.objects.filter(username=username).exists():
             return ValidationError("Nome de usu\u00e1rio j\u00e1 existe").to_response()
 
-        if email and User.objects.filter(email=email).exists():
+        if User.objects.filter(email__iexact=email).exists():
             return ValidationError("Email j\u00e1 cadastrado").to_response()
 
-        user = User.objects.create_user(
-            username=username,
-            email=email,
-            password=password,
-            first_name=first_name,
-            last_name=last_name,
-        )
-        UserProfile.objects.create(user=user, birth_date=birth_date)
-        conversation = ensure_user_conversation(user)
+        with transaction.atomic():
+            user = User.objects.create_user(
+                username=username,
+                email=email,
+                password=password,
+                first_name=first_name,
+                last_name=last_name,
+            )
+            UserProfile.objects.create(user=user, birth_date=birth_date)
+            LegalAcceptance.objects.create(
+                user=user,
+                terms_version=CURRENT_TERMS_VERSION,
+                privacy_version=CURRENT_PRIVACY_VERSION,
+                source='android',
+            )
+            conversation = ensure_user_conversation(user)
+            _issue_email_verification(user)
 
         # Generate tokens
         refresh = RefreshToken.for_user(user)
@@ -88,10 +196,43 @@ def register_user(request):
             'conversation_id': conversation.id,
             'access': str(refresh.access_token),
             'refresh': str(refresh),
+            'legal_acceptance': {
+                **current_legal_versions(),
+                'accepted': True,
+            },
         }, status=201)
 
     except Exception as e:
         return handle_exception(e)
+
+
+@api_view(['GET', 'POST'])
+@permission_classes([IsAuthenticated])
+def legal_acceptance(request):
+    if request.method == 'GET':
+        accepted = _has_current_legal_acceptance(request.user)
+        return Response({
+            **current_legal_versions(),
+            'accepted': accepted,
+            'required': not accepted,
+        })
+
+    legal_error = _validate_legal_acceptance_payload(request)
+    if legal_error:
+        return legal_error
+
+    acceptance, created = LegalAcceptance.objects.get_or_create(
+        user=request.user,
+        terms_version=CURRENT_TERMS_VERSION,
+        privacy_version=CURRENT_PRIVACY_VERSION,
+        defaults={'source': 'android'},
+    )
+    return Response({
+        **current_legal_versions(),
+        'accepted': True,
+        'required': False,
+        'accepted_at': acceptance.accepted_at.isoformat(),
+    }, status=201 if created else 200)
 
 
 @api_view(['GET', 'PUT'])
@@ -110,6 +251,7 @@ def user_profile(request):
                 'first_name': user.first_name,
                 'last_name': user.last_name,
                 'birth_date': profile.birth_date.isoformat() if profile else '',
+                'email_verified': bool(profile and profile.email_verified_at),
             })
 
         # PUT
@@ -117,14 +259,27 @@ def user_profile(request):
         last_name = request.data.get('last_name', user.last_name)
         email = request.data.get('email', user.email)
 
-        if email and email != user.email:
-            if User.objects.filter(email=email).exclude(id=user.id).exists():
+        email_changed = bool(email) and email != user.email
+        if email_changed:
+            try:
+                EmailValidator()(email)
+            except DjangoValidationError:
+                return ValidationError("Email inv\u00e1lido").to_response()
+            if User.objects.filter(email__iexact=email).exclude(id=user.id).exists():
                 return ValidationError("Email j\u00e1 cadastrado por outro usu\u00e1rio").to_response()
 
         user.first_name = first_name
         user.last_name = last_name
         user.email = email or ''
         user.save()
+
+        # Trocou de e-mail: a confirma\u00e7\u00e3o anterior deixa de valer.
+        if email_changed:
+            profile = UserProfile.objects.filter(user=user).first()
+            if profile is not None and profile.email_verified_at is not None:
+                profile.email_verified_at = None
+                profile.save(update_fields=['email_verified_at'])
+            _issue_email_verification(user)
 
         return Response({
             'status': 'ok',
@@ -134,6 +289,314 @@ def user_profile(request):
             'first_name': user.first_name,
             'last_name': user.last_name,
         })
+
+    except Exception as e:
+        if attachment:
+            log_upload_result(
+                message_id=None,
+                detected_format="unknown",
+                size=getattr(attachment, "size", 0),
+                result="processing_failed",
+                sha256=attachment_hash or "-",
+            )
+        return handle_exception(e)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def logout_user(request):
+    """Encerra a sessão: blacklista o refresh e remove o token do aparelho."""
+    try:
+        refresh = str(request.data.get('refresh', '')).strip()
+        if refresh:
+            try:
+                RefreshToken(refresh).blacklist()
+            except TokenError:
+                pass  # já expirado ou inválido — nada a revogar
+
+        device_token = str(request.data.get('device_token', '')).strip()
+        if device_token:
+            DeviceToken.objects.filter(user=request.user, token=device_token).delete()
+
+        return Response({'status': 'ok'})
+
+    except Exception as e:
+        return handle_exception(e)
+
+
+# PASSWORD RESET
+
+def _find_user_by_identifier(identifier):
+    return (
+        User.objects.filter(username__iexact=identifier).first()
+        or User.objects.filter(email__iexact=identifier).first()
+    )
+
+
+def _get_active_reset_code(user):
+    """Somente o código não usado mais recente vale."""
+    return (
+        PasswordResetCode.objects
+        .filter(user=user, used_at__isnull=True)
+        .order_by('-created_at')
+        .first()
+    )
+
+
+def _validate_timed_code(code_obj, code_value):
+    """Regras comuns aos códigos de reset e de confirmação de e-mail.
+
+    Retorna (code_obj, error_response): exatamente um dos dois é None.
+    """
+    if code_obj is None:
+        return None, ValidationError("Código inválido ou expirado").to_response()
+
+    if code_obj.attempts >= RESET_CODE_MAX_ATTEMPTS:
+        return None, RateLimitError().to_response()
+
+    if code_obj.expires_at < timezone.now():
+        return None, ValidationError("Código inválido ou expirado").to_response()
+
+    if code_obj.code != code_value:
+        code_obj.attempts += 1
+        code_obj.save(update_fields=['attempts'])
+        if code_obj.attempts >= RESET_CODE_MAX_ATTEMPTS:
+            return None, RateLimitError().to_response()
+        return None, ValidationError("Código inválido ou expirado").to_response()
+
+    return code_obj, None
+
+
+def _validate_reset_code(user, code_value):
+    return _validate_timed_code(_get_active_reset_code(user), code_value)
+
+
+def _generate_numeric_code():
+    return ''.join(secrets.choice('0123456789') for _ in range(6))
+
+
+def _parse_event_datetime(value):
+    """Aceita ISO datetime ou data pura; retorna datetime aware ou None."""
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        text = str(value)
+        parsed = parse_datetime(text)
+        if parsed is None:
+            as_date = parse_date(text)
+            if as_date is not None:
+                parsed = datetime(as_date.year, as_date.month, as_date.day)
+    if parsed is None:
+        return None
+    if timezone.is_naive(parsed):
+        parsed = timezone.make_aware(parsed)
+    return parsed
+
+
+@api_view(['POST'])
+def request_password_reset(request):
+    """Envia o código de redefinição. Resposta neutra: não revela contas."""
+    try:
+        identifier = str(request.data.get('identifier', '')).strip()
+        if not identifier:
+            return ValidationError("Informe usuário ou email").to_response()
+
+        neutral = Response({'status': 'ok'})
+
+        user = _find_user_by_identifier(identifier)
+        if user is None or not user.email:
+            return neutral
+
+        window_start = timezone.now() - timedelta(minutes=RESET_CODE_TTL_MINUTES)
+        recent_requests = PasswordResetCode.objects.filter(
+            user=user, created_at__gte=window_start
+        ).count()
+        if recent_requests >= RESET_REQUESTS_PER_WINDOW:
+            return RateLimitError().to_response()
+
+        code = _generate_numeric_code()
+        PasswordResetCode.objects.create(
+            user=user,
+            code=code,
+            expires_at=timezone.now() + timedelta(minutes=RESET_CODE_TTL_MINUTES),
+        )
+
+        try:
+            send_mail(
+                subject='CoParent Lite — Código de redefinição de senha',
+                message=(
+                    f'Olá, {user.first_name or user.username}!\n\n'
+                    f'Seu código de redefinição de senha é: {code}\n\n'
+                    f'Ele vale por {RESET_CODE_TTL_MINUTES} minutos e pode ser usado uma única vez.\n'
+                    'Se você não pediu a redefinição, ignore este e-mail.'
+                ),
+                from_email=None,
+                recipient_list=[user.email],
+                fail_silently=False,
+            )
+        except Exception as e:
+            logger.error(f"Falha ao enviar e-mail de reset para user {user.id}: {e}")
+
+        return neutral
+
+    except Exception as e:
+        return handle_exception(e)
+
+
+@api_view(['POST'])
+def verify_password_reset(request):
+    """Confere o código antes da tela de nova senha."""
+    try:
+        identifier = str(request.data.get('identifier', '')).strip()
+        code_value = str(request.data.get('code', '')).strip()
+        if not identifier or not code_value:
+            return ValidationError("Código inválido ou expirado").to_response()
+
+        user = _find_user_by_identifier(identifier)
+        if user is None:
+            return ValidationError("Código inválido ou expirado").to_response()
+
+        _, error = _validate_reset_code(user, code_value)
+        if error is not None:
+            return error
+
+        return Response({'status': 'ok'})
+
+    except Exception as e:
+        return handle_exception(e)
+
+
+@api_view(['POST'])
+def confirm_password_reset(request):
+    """Troca a senha, consome o código e derruba as sessões existentes."""
+    try:
+        identifier = str(request.data.get('identifier', '')).strip()
+        code_value = str(request.data.get('code', '')).strip()
+        new_password = request.data.get('new_password', '')
+
+        if not identifier or not code_value:
+            return ValidationError("Código inválido ou expirado").to_response()
+
+        user = _find_user_by_identifier(identifier)
+        if user is None:
+            return ValidationError("Código inválido ou expirado").to_response()
+
+        reset_code, error = _validate_reset_code(user, code_value)
+        if error is not None:
+            return error
+
+        try:
+            validate_password(new_password, user=user)
+        except DjangoValidationError as e:
+            return ValidationError(" ".join(e.messages)).to_response()
+
+        with transaction.atomic():
+            user.set_password(new_password)
+            user.save(update_fields=['password'])
+            reset_code.used_at = timezone.now()
+            reset_code.save(update_fields=['used_at'])
+
+            # Sessões antigas caem: refresh tokens emitidos até aqui são
+            # colocados na blacklist.
+            for token in OutstandingToken.objects.filter(user=user):
+                BlacklistedToken.objects.get_or_create(token=token)
+
+        return Response({'status': 'ok'})
+
+    except Exception as e:
+        return handle_exception(e)
+
+
+# EMAIL VERIFICATION
+
+def _issue_email_verification(user):
+    """Cria e envia o código de confirmação; nunca derruba o fluxo chamador."""
+    code = _generate_numeric_code()
+    EmailVerificationCode.objects.create(
+        user=user,
+        code=code,
+        expires_at=timezone.now() + timedelta(minutes=RESET_CODE_TTL_MINUTES),
+    )
+    try:
+        send_mail(
+            subject='CoParent Lite — Confirme seu e-mail',
+            message=(
+                f'Olá, {user.first_name or user.username}!\n\n'
+                f'Seu código de confirmação de e-mail é: {code}\n\n'
+                f'Ele vale por {RESET_CODE_TTL_MINUTES} minutos.\n'
+                'Se você não criou uma conta no CoParent Lite, ignore este e-mail.'
+            ),
+            from_email=None,
+            recipient_list=[user.email],
+            fail_silently=False,
+        )
+    except Exception as e:
+        logger.error(f"Falha ao enviar e-mail de verificação para user {user.id}: {e}")
+
+
+def _get_active_verification_code(user):
+    return (
+        EmailVerificationCode.objects
+        .filter(user=user, used_at__isnull=True)
+        .order_by('-created_at')
+        .first()
+    )
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def verify_email(request):
+    """Confirma o e-mail da conta com o código recebido."""
+    try:
+        code_value = str(request.data.get('code', '')).strip()
+        if not code_value:
+            return ValidationError("Código é obrigatório").to_response()
+
+        profile = UserProfile.objects.filter(user=request.user).first()
+        if profile is not None and profile.email_verified_at is not None:
+            return ValidationError("E-mail já confirmado").to_response()
+
+        code_obj, error = _validate_timed_code(
+            _get_active_verification_code(request.user), code_value
+        )
+        if error is not None:
+            return error
+
+        code_obj.used_at = timezone.now()
+        code_obj.save(update_fields=['used_at'])
+        if profile is None:
+            profile = UserProfile.objects.create(user=request.user, birth_date=date.today())
+        profile.email_verified_at = timezone.now()
+        profile.save(update_fields=['email_verified_at'])
+
+        return Response({'status': 'ok', 'email_verified': True})
+
+    except Exception as e:
+        return handle_exception(e)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def resend_email_verification(request):
+    """Reenvia o código de confirmação, com o mesmo rate limit do reset."""
+    try:
+        user = request.user
+        if not user.email:
+            return ValidationError("Conta sem e-mail cadastrado").to_response()
+
+        profile = UserProfile.objects.filter(user=user).first()
+        if profile is not None and profile.email_verified_at is not None:
+            return ValidationError("E-mail já confirmado").to_response()
+
+        window_start = timezone.now() - timedelta(minutes=RESET_CODE_TTL_MINUTES)
+        recent = EmailVerificationCode.objects.filter(
+            user=user, created_at__gte=window_start
+        ).count()
+        if recent >= RESET_REQUESTS_PER_WINDOW:
+            return RateLimitError().to_response()
+
+        _issue_email_verification(user)
+        return Response({'status': 'ok'})
 
     except Exception as e:
         return handle_exception(e)
@@ -155,7 +618,7 @@ def list_conversations(request):
                 participants.append({
                     'id': p.id,
                     'username': p.username,
-                    'is_me': p.id == request.user.id
+                    'is_me': p.id == request.user.id,
                 })
             children = Child.objects.filter(conversation=conv)
             children_data = ChildSerializer(children, many=True, context={'request': request}).data
@@ -165,7 +628,126 @@ def list_conversations(request):
                 'participants': participants,
                 'children': children_data
             })
+        # Conversa compartilhada primeiro: o app usa a primeira da lista
+        # como workspace ativo.
+        result.sort(key=lambda c: (-len(c['participants']), c['id']))
         return Response(result)
+    except Exception as e:
+        return handle_exception(e)
+
+
+# INVITES
+
+def _generate_invite_code():
+    while True:
+        code = ''.join(secrets.choice(INVITE_CODE_ALPHABET) for _ in range(INVITE_CODE_LENGTH))
+        if not ConversationInvite.objects.filter(code=code).exists():
+            return code
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def create_invite(request):
+    """Gera o código de convite da conversa, invalidando o anterior."""
+    try:
+        conversation_id = request.data.get('conversation_id')
+        if not conversation_id:
+            return ValidationError("conversation_id é obrigatório").to_response()
+
+        try:
+            conversation = Conversation.objects.get(id=conversation_id)
+        except Conversation.DoesNotExist:
+            return NotFoundError("Conversa").to_response()
+
+        if not conversation.participants.filter(id=request.user.id).exists():
+            return ForbiddenError("Você não faz parte dessa conversa").to_response()
+
+        if conversation.participants.count() >= MAX_CONVERSATION_PARTICIPANTS:
+            return ValidationError("Esta conversa já tem dois responsáveis").to_response()
+
+        ConversationInvite.objects.filter(
+            conversation=conversation, accepted_by__isnull=True
+        ).delete()
+
+        invite = ConversationInvite.objects.create(
+            conversation=conversation,
+            created_by=request.user,
+            code=_generate_invite_code(),
+            expires_at=timezone.now() + timedelta(days=INVITE_TTL_DAYS),
+        )
+
+        return Response({
+            'status': 'ok',
+            'code': invite.code,
+            'invite_url': f'{settings.INVITE_LINK_BASE}{invite.code}',
+            'expires_at': invite.expires_at,
+        }, status=201)
+
+    except Exception as e:
+        return handle_exception(e)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def accept_invite(request):
+    """Entra na conversa do convite e migra o workspace solo do convidado."""
+    try:
+        code = str(request.data.get('code', '')).strip().upper()
+        if not code:
+            return ValidationError("Código é obrigatório").to_response()
+
+        try:
+            invite = ConversationInvite.objects.get(code=code)
+        except ConversationInvite.DoesNotExist:
+            return NotFoundError("Convite").to_response()
+
+        if invite.accepted_by is not None:
+            return ValidationError("Este convite já foi utilizado").to_response()
+
+        if invite.expires_at < timezone.now():
+            return ValidationError("Convite expirado. Peça um novo código").to_response()
+
+        conversation = invite.conversation
+
+        if conversation.participants.filter(id=request.user.id).exists():
+            return ValidationError("Você já faz parte dessa conversa").to_response()
+
+        if conversation.participants.count() >= MAX_CONVERSATION_PARTICIPANTS:
+            return ValidationError("Esta conversa já tem dois responsáveis").to_response()
+
+        with transaction.atomic():
+            conversation.participants.add(request.user)
+            invite.accepted_by = request.user
+            invite.accepted_at = timezone.now()
+            invite.save(update_fields=['accepted_by', 'accepted_at'])
+
+            # O convidado ganhou um workspace solo no cadastro; filhos e
+            # eventos registrados lá migram para a conversa da família.
+            solo_conversations = Conversation.objects.filter(
+                participants=request.user
+            ).exclude(id=conversation.id)
+            for solo in solo_conversations:
+                if solo.participants.count() != 1:
+                    continue
+                Child.objects.filter(conversation=solo).update(conversation=conversation)
+                Event.objects.filter(conversation=solo).update(conversation=conversation)
+                if not Message.objects.filter(conversation=solo).exists():
+                    solo.delete()
+
+        participants = [
+            {
+                'id': p.id,
+                'username': p.username,
+                'is_me': p.id == request.user.id,
+            }
+            for p in conversation.participants.all()
+        ]
+        return Response({
+            'status': 'ok',
+            'conversation_id': conversation.id,
+            'participants': participants,
+        })
+
     except Exception as e:
         return handle_exception(e)
 
@@ -195,7 +777,7 @@ def send_message(request):
             return NotFoundError("Conversa").to_response()
 
         # Check authorization
-        if request.user not in conversation.participants.all():
+        if not conversation.participants.filter(id=request.user.id).exists():
             return ForbiddenError("VocÃª nÃ£o faz parte dessa conversa").to_response()
 
         # Create message
@@ -222,48 +804,94 @@ def send_message_with_attachment(request):
     """Send a message with a file attachment (image/document)."""
     try:
         conversation_id = request.data.get('conversation_id')
-        content = request.data.get('content', '')
         attachment = request.FILES.get('attachment')
+        content = request.data.get('content', '') or ''
 
         if not conversation_id:
             return ValidationError("conversation_id Ã© obrigatÃ³rio").to_response()
 
         if not content and not attachment:
             return ValidationError("Mensagem ou anexo Ã© obrigatÃ³rio").to_response()
+        if len(content) > MAX_MESSAGE_LENGTH:
+            return ValidationError("A mensagem deve ter no máximo 2000 caracteres.").to_response()
 
         try:
             conversation = Conversation.objects.get(id=conversation_id)
         except Conversation.DoesNotExist:
             return NotFoundError("Conversa").to_response()
 
-        if request.user not in conversation.participants.all():
+        if not conversation.participants.filter(id=request.user.id).exists():
             return ForbiddenError("VocÃª nÃ£o faz parte dessa conversa").to_response()
 
-        # Determine attachment type
+        try:
+            enforce_upload_rate_limit(
+                request.user.id,
+                request.META.get('REMOTE_ADDR') or request.META.get('HTTP_X_FORWARDED_FOR', '').split(',')[0].strip(),
+            )
+        except UploadSecurityError as exc:
+            return ValidationError(str(exc)).to_response()
+
         attachment_type = ''
+        content_file = None
+        attachment_size = 0
+        attachment_hash = ''
         if attachment:
-            content_type = attachment.content_type or ''
-            if content_type.startswith('image/'):
-                attachment_type = 'image'
-            elif content_type == 'application/pdf':
-                attachment_type = 'pdf'
-            else:
-                attachment_type = 'document'
+            try:
+                if attachment.size > MAX_ATTACHMENT_SIZE:
+                    raise AttachmentValidationError("Arquivo muito grande (máximo 10 MB).")
+                content_file, attachment_type = validate_attachment(
+                    attachment,
+                    attachment.read(),
+                )
+                attachment_size = content_file.size
+                enforce_daily_quota(request.user.id, attachment_size)
+                clean_content = content_file.read()
+                attachment_hash = content_sha256(clean_content)
+                scan_with_clamav(clean_content)
+                content_file.seek(0)
+            except UploadSecurityError as exc:
+                log_upload_result(
+                    message_id=None,
+                    detected_format=attachment_type,
+                    size=attachment.size,
+                    result="rejected",
+                    sha256=attachment_hash or "-",
+                )
+                return ValidationError(str(exc)).to_response()
+            except AttachmentValidationError as exc:
+                log_upload_result(
+                    message_id=None,
+                    detected_format="unknown",
+                    size=attachment.size,
+                    result="rejected",
+                    sha256="-",
+                )
+                return ValidationError(str(exc)).to_response()
 
-            # Limit file size (10MB)
-            if attachment.size > 10 * 1024 * 1024:
-                return ValidationError("Arquivo muito grande (mÃ¡x 10MB)").to_response()
-
-        message = Message.objects.create(
-            conversation=conversation,
-            sender=request.user,
-            content=content,
-            attachment=attachment,
-            attachment_type=attachment_type
-        )
-
-        serializer = MessageSerializer(message, context={'request': request})
-        return Response(serializer.data, status=201)
+        try:
+            message = Message.objects.create(
+                conversation=conversation,
+                sender=request.user,
+                content=content,
+                attachment=content_file,
+                attachment_type=attachment_type,
+                attachment_size=attachment_size,
+                attachment_sha256=attachment_hash,
+                attachment_status=Message.ATTACHMENT_APPROVED,
+            )
+            log_upload_result(
+                message_id=message.id,
+                detected_format=attachment_type,
+                size=attachment_size,
+                result="approved",
+                sha256=message.attachment_sha256,
+            )
+            serializer = MessageSerializer(message, context={'request': request})
+            return Response(serializer.data, status=201)
+        except Exception:
+            if content_file and content_file.name:
+                default_storage.delete(content_file.name)
+            raise
 
     except Exception as e:
         return handle_exception(e)
@@ -280,7 +908,7 @@ def list_children(request, conversation_id):
         except Conversation.DoesNotExist:
             return NotFoundError("Conversa").to_response()
 
-        if request.user not in conversation.participants.all():
+        if not conversation.participants.filter(id=request.user.id).exists():
             return ForbiddenError("VocÃª nÃ£o faz parte dessa conversa").to_response()
 
         children = Child.objects.filter(conversation_id=conversation_id)
@@ -309,24 +937,41 @@ def create_child(request):
             return ValidationError("Nome muito longo (mÃ¡x 100 caracteres)").to_response()
 
         if not birth_date:
-            return ValidationError("Data de nascimento Ã© obrigatÃ³ria").to_response()
+            return ValidationError("Data de nascimento é obrigatória").to_response()
+
+        try:
+            parsed_birth_date = date.fromisoformat(str(birth_date))
+        except ValueError:
+            return ValidationError("Data de nascimento inválida").to_response()
+
+        if parsed_birth_date > date.today():
+            return ValidationError("Data de nascimento não pode estar no futuro").to_response()
+
+        if not _is_accepted(request.data.get('declare_legal_responsibility')):
+            return ValidationError("É necessário declarar que você é pai, mãe ou responsável legal pela criança").to_response()
 
         try:
             conversation = Conversation.objects.get(id=conversation_id)
         except Conversation.DoesNotExist:
             return NotFoundError("Conversa").to_response()
 
-        if request.user not in conversation.participants.all():
-            return ForbiddenError("VocÃª nÃ£o faz parte dessa conversa").to_response()
+        if not conversation.participants.filter(id=request.user.id).exists():
+            return ForbiddenError("Você não faz parte dessa conversa").to_response()
 
+        has_custody = _is_accepted(request.data.get('has_custody', False))
         child = Child.objects.create(
             conversation=conversation,
             created_by=request.user,
             name=name.strip(),
-            birth_date=birth_date,
-            cpf=request.data.get('cpf', ''),
-            rg=request.data.get('rg', ''),
-            has_custody=request.data.get('has_custody', False)
+            birth_date=parsed_birth_date,
+            has_custody=has_custody,
+            custody_holder=request.user if has_custody else None,
+        )
+        ChildLegalDeclaration.objects.create(
+            child=child,
+            declared_by=request.user,
+            declaration_version=CURRENT_CHILD_DECLARATION_VERSION,
+            source='android',
         )
         serializer = ChildSerializer(child, context={'request': request})
         return Response(serializer.data, status=201)
@@ -345,7 +990,7 @@ def update_child(request, child_id):
         except Child.DoesNotExist:
             return NotFoundError("Filho").to_response()
 
-        if request.user not in child.conversation.participants.all():
+        if not child.conversation.participants.filter(id=request.user.id).exists():
             return ForbiddenError("Voc\u00ea n\u00e3o faz parte dessa conversa").to_response()
 
         name = request.data.get('name', child.name)
@@ -368,22 +1013,28 @@ def update_child(request, child_id):
             except ValueError:
                 return ValidationError("Data de nascimento inv\u00e1lida").to_response()
 
+        if parsed_birth_date > date.today():
+            return ValidationError("Data de nascimento não pode estar no futuro").to_response()
+
         child.name = name
         child.birth_date = parsed_birth_date
-        if 'cpf' in request.data:
-            child.cpf = request.data.get('cpf') or ''
-        if 'rg' in request.data:
-            child.rg = request.data.get('rg') or ''
         if 'has_custody' in request.data:
             custody_value = request.data.get('has_custody')
             if isinstance(custody_value, bool):
-                child.has_custody = custody_value
+                parsed_custody = custody_value
             elif str(custody_value).lower() in ('true', '1'):
-                child.has_custody = True
+                parsed_custody = True
             elif str(custody_value).lower() in ('false', '0'):
-                child.has_custody = False
+                parsed_custody = False
             else:
                 return ValidationError("Valor de guarda inv\u00e1lido").to_response()
+
+            if parsed_custody:
+                child.has_custody = True
+                child.custody_holder = request.user
+            elif child.custody_holder_id in (None, request.user.id):
+                child.has_custody = False
+                child.custody_holder = None
 
         photo = request.FILES.get('photo')
         if photo is not None:
@@ -410,7 +1061,7 @@ def delete_child(request, child_id):
         except Child.DoesNotExist:
             return NotFoundError("Filho").to_response()
 
-        if request.user not in child.conversation.participants.all():
+        if not child.conversation.participants.filter(id=request.user.id).exists():
             return ForbiddenError("VocÃª nÃ£o faz parte dessa conversa").to_response()
 
         child.delete()
@@ -431,13 +1082,34 @@ def list_messages(request, conversation_id):
             return NotFoundError("Conversa").to_response()
 
         # Verify authorization
-        if request.user not in conversation.participants.all():
+        if not conversation.participants.filter(id=request.user.id).exists():
             return ForbiddenError("VocÃª nÃ£o faz parte dessa conversa").to_response()
 
-        # Get messages
-        messages = Message.objects.filter(
-            conversation_id=conversation_id
-        ).order_by('created_at')[:100]  # Limit to 100 recent messages
+        # Pagination: returns the most recent page by default; `before=<message_id>`
+        # walks backwards through history. Response stays in chronological order.
+        MAX_PAGE_SIZE = 100
+        try:
+            limit = int(request.query_params.get('limit', MAX_PAGE_SIZE))
+        except (TypeError, ValueError):
+            return ValidationError("limit inválido").to_response()
+        limit = max(1, min(limit, MAX_PAGE_SIZE))
+
+        queryset = Message.objects.filter(conversation_id=conversation_id).prefetch_related(
+            'messageread_set__reader'
+        )
+
+        before = request.query_params.get('before')
+        if before is not None:
+            try:
+                before_id = int(before)
+            except (TypeError, ValueError):
+                return ValidationError("before inválido").to_response()
+            queryset = queryset.filter(id__lt=before_id)
+
+        # ids are append-only, so ordering by -id == newest first without
+        # created_at ties. Slice the page, then restore chronological order.
+        messages = list(queryset.order_by('-id')[:limit])
+        messages.reverse()
 
         serializer = MessageSerializer(messages, many=True, context={'request': request})
         return Response(serializer.data)
@@ -457,7 +1129,7 @@ def message_detail(request, message_id):
             return NotFoundError("Mensagem").to_response()
 
         # Verify authorization
-        if request.user not in message.conversation.participants.all():
+        if not message.conversation.participants.filter(id=request.user.id).exists():
             return ForbiddenError("VocÃª nÃ£o faz parte dessa conversa").to_response()
 
         serializer = MessageDetailSerializer(message)
@@ -478,7 +1150,7 @@ def mark_message_read(request, message_id):
             return NotFoundError("Mensagem").to_response()
 
         # Verify user is conversation participant
-        if request.user not in message.conversation.participants.all():
+        if not message.conversation.participants.filter(id=request.user.id).exists():
             return ForbiddenError("VocÃª nÃ£o faz parte dessa conversa").to_response()
 
         # Mark as read
@@ -494,6 +1166,71 @@ def mark_message_read(request, message_id):
 
 # EVENTS
 
+EVENT_EDITABLE_FIELDS = ('title', 'event_date', 'event_date_end', 'event_type', 'notes')
+EVENT_NOTES_MAX_LENGTH = 5000
+
+
+def _event_snapshot(event):
+    return {
+        'title': event.title,
+        'event_date': event.event_date.isoformat() if event.event_date else None,
+        'event_date_end': event.event_date_end.isoformat() if event.event_date_end else None,
+        'event_type': event.event_type,
+        'notes': event.notes,
+    }
+
+
+def _record_event_change(event, actor, action, changes=None):
+    return EventChange.objects.create(
+        event=event,
+        event_id_snapshot=event.id,
+        conversation=event.conversation,
+        actor=actor,
+        action=action,
+        event_title=event.title,
+        changes=changes or {},
+        snapshot=_event_snapshot(event),
+        version=event.version,
+    )
+
+
+def _validate_event_values(title, event_date, event_date_end, event_type, notes):
+    clean_title = str(title or '').strip()
+    if not clean_title:
+        return None, ValidationError("Título do evento é obrigatório").to_response()
+    if len(clean_title) > 255:
+        return None, ValidationError("Título muito longo (máx. 255 caracteres)").to_response()
+
+    clean_type = str(event_type or '').strip().upper()
+    if clean_type not in dict(Event.TYPE_CHOICES):
+        return None, ValidationError("Tipo de evento inválido").to_response()
+
+    clean_notes = str(notes or '').strip()
+    if len(clean_notes) > EVENT_NOTES_MAX_LENGTH:
+        return None, ValidationError("Notas muito longas (máx. 5000 caracteres)").to_response()
+
+    if event_date is None:
+        return None, ValidationError("Data do evento é obrigatória").to_response()
+    parsed_start = event_date if isinstance(event_date, datetime) else _parse_event_datetime(event_date)
+    if parsed_start is None:
+        return None, ValidationError("Data do evento inválida").to_response()
+
+    parsed_end = None
+    if event_date_end not in (None, ''):
+        parsed_end = event_date_end if isinstance(event_date_end, datetime) else _parse_event_datetime(event_date_end)
+        if parsed_end is None:
+            return None, ValidationError("Data de fim do evento inválida").to_response()
+        if parsed_end <= parsed_start:
+            return None, ValidationError("A data de fim deve ser após o início").to_response()
+
+    return {
+        'title': clean_title,
+        'event_date': parsed_start,
+        'event_date_end': parsed_end,
+        'event_type': clean_type,
+        'notes': clean_notes,
+    }, None
+
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def create_event(request):
@@ -504,21 +1241,14 @@ def create_event(request):
         event_type = request.data.get('event_type')
         notes = request.data.get('notes', '')
         event_date_end = request.data.get('event_date_end', None)
-        # Validate input
         if not conversation_id:
-            return ValidationError("conversation_id Ã© obrigatÃ³rio").to_response()
+            return ValidationError("conversation_id é obrigatório").to_response()
 
-        if not title or len(title.strip()) == 0:
-            return ValidationError("TÃ­tulo do evento Ã© obrigatÃ³rio").to_response()
-
-        if len(title) > 255:
-            return ValidationError("TÃ­tulo muito longo (mÃ¡x 255 caracteres)").to_response()
-
-        if not event_date:
-            return ValidationError("Data do evento Ã© obrigatÃ³ria").to_response()
-
-        if not event_type:
-            return ValidationError("Tipo de evento Ã© obrigatÃ³rio").to_response()
+        values, error_response = _validate_event_values(
+            title, event_date, event_date_end, event_type, notes
+        )
+        if error_response:
+            return error_response
 
         # Verify conversation exists
         try:
@@ -527,19 +1257,16 @@ def create_event(request):
             return NotFoundError("Conversa").to_response()
 
         # Check authorization
-        if request.user not in conversation.participants.all():
-            return ForbiddenError("VocÃª nÃ£o faz parte dessa conversa").to_response()
+        if not conversation.participants.filter(id=request.user.id).exists():
+            return ForbiddenError("Você não faz parte dessa conversa").to_response()
 
-        # Create event
-        event = Event.objects.create(
-            conversation=conversation,
-            created_by=request.user,
-            title=title.strip(),
-            event_date=event_date,
-            event_date_end=event_date_end,
-            event_type=event_type,
-            notes=notes
-        )
+        with transaction.atomic():
+            event = Event.objects.create(
+                conversation=conversation,
+                created_by=request.user,
+                **values,
+            )
+            _record_event_change(event, request.user, EventChange.CREATED)
         serializer = EventSerializer(event)
         return Response(serializer.data, status=201)
 
@@ -558,7 +1285,7 @@ def list_events(request, conversation_id):
             return NotFoundError("Conversa").to_response()
 
         # Check authorization
-        if request.user not in conversation.participants.all():
+        if not conversation.participants.filter(id=request.user.id).exists():
             return ForbiddenError("VocÃª nÃ£o faz parte dessa conversa").to_response()
 
         # Get events
@@ -575,56 +1302,104 @@ def list_events(request, conversation_id):
 def delete_event(request, event_id):
     try:
         # Verify event exists
-        try:
-            event = Event.objects.get(id=event_id)
-        except Event.DoesNotExist:
-            return NotFoundError("Evento").to_response()
+        with transaction.atomic():
+            try:
+                event = Event.objects.select_for_update().get(id=event_id)
+            except Event.DoesNotExist:
+                return NotFoundError("Evento").to_response()
 
-        # Check authorization (only creator or conversation admin can delete)
-        if request.user not in event.conversation.participants.all():
-            return ForbiddenError("VocÃª nÃ£o faz parte dessa conversa").to_response()
+            if not event.conversation.participants.filter(id=request.user.id).exists():
+                return ForbiddenError("Você não faz parte dessa conversa").to_response()
 
-        # Delete event
-        event.delete()
+            _record_event_change(event, request.user, EventChange.DELETED)
+            event.delete()
         return Response({'status': 'ok'})
 
     except Exception as e:
         return handle_exception(e)
 
 
-@api_view(['PUT'])
+@api_view(['PUT', 'PATCH'])
 @permission_classes([IsAuthenticated])
 def update_event(request, event_id):
-    """Update an existing event."""
     try:
-        try:
-            event = Event.objects.get(id=event_id)
-        except Event.DoesNotExist:
-            return NotFoundError("Evento").to_response()
+        with transaction.atomic():
+            try:
+                event = Event.objects.select_for_update().get(id=event_id)
+            except Event.DoesNotExist:
+                return NotFoundError("Evento").to_response()
 
-        if request.user not in event.conversation.participants.all():
-            return ForbiddenError("Voc\u00ea n\u00e3o faz parte dessa conversa").to_response()
+            if not event.conversation.participants.filter(id=request.user.id).exists():
+                return ForbiddenError("Você não faz parte dessa conversa").to_response()
 
-        title = request.data.get('title', event.title)
-        event_date = request.data.get('event_date', None)
-        event_date_end = request.data.get('event_date_end', event.event_date_end)
-        event_type = request.data.get('event_type', event.event_type)
-        notes = request.data.get('notes', event.notes)
+            values, error_response = _validate_event_values(
+                request.data.get('title', event.title),
+                request.data.get('event_date', event.event_date),
+                request.data.get('event_date_end', event.event_date_end),
+                request.data.get('event_type', event.event_type),
+                request.data.get('notes', event.notes),
+            )
+            if error_response:
+                return error_response
 
-        if title and len(title.strip()) == 0:
-            return ValidationError("T\u00edtulo n\u00e3o pode estar vazio").to_response()
+            requested_version = request.data.get('version')
+            if requested_version is None:
+                return ValidationError("A versão do evento é obrigatória").to_response()
+            try:
+                requested_version = int(requested_version)
+            except (TypeError, ValueError):
+                return ValidationError("Versão do evento inválida").to_response()
+            if requested_version != event.version:
+                return Response(
+                    {
+                        'error': {
+                            'code': 'EVENT_VERSION_CONFLICT',
+                            'message': 'Este evento foi atualizado por outro responsável.',
+                        },
+                        'current_version': event.version,
+                    },
+                    status=409,
+                )
 
-        event.title = title.strip() if title else event.title
-        if event_date:
-            event.event_date = event_date
-        event.event_date_end = event_date_end
-        event.event_type = event_type
-        event.notes = notes
-        event.save()
+            before = _event_snapshot(event)
+            after = {
+                key: value.isoformat() if isinstance(value, datetime) else value
+                for key, value in values.items()
+            }
+            changes = {
+                key: {'before': before[key], 'after': after[key]}
+                for key in EVENT_EDITABLE_FIELDS
+                if before[key] != after[key]
+            }
+
+            if changes:
+                for key, value in values.items():
+                    setattr(event, key, value)
+                event.version += 1
+                event.save()
+                _record_event_change(event, request.user, EventChange.UPDATED, changes)
 
         serializer = EventSerializer(event)
         return Response(serializer.data)
 
+    except Exception as e:
+        return handle_exception(e)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def list_event_changes(request, conversation_id):
+    try:
+        try:
+            conversation = Conversation.objects.get(id=conversation_id)
+        except Conversation.DoesNotExist:
+            return NotFoundError("Conversa").to_response()
+
+        if not conversation.participants.filter(id=request.user.id).exists():
+            return ForbiddenError("Você não faz parte dessa conversa").to_response()
+
+        changes = EventChange.objects.filter(conversation=conversation).select_related('actor')[:200]
+        return Response(EventChangeSerializer(changes, many=True).data)
     except Exception as e:
         return handle_exception(e)
 
@@ -644,10 +1419,10 @@ def register_device_token(request):
         if len(token) > 1000:
             return ValidationError("Token muito longo").to_response()
 
-        # Register device token
+        # B7: chave é o token (aparelho); trocar de conta reatribui o device.
         device, _ = DeviceToken.objects.update_or_create(
-            user=request.user,
-            defaults={'token': token.strip()}
+            token=token.strip(),
+            defaults={'user': request.user}
         )
         return Response({'status': 'ok', 'token_id': device.id})
 
@@ -659,9 +1434,24 @@ def register_device_token(request):
 @permission_classes([IsAuthenticated])
 def list_notifications(request):
     try:
-        notifications = Notification.objects.filter(
-            recipient=request.user
-        ).order_by('-sent_at')[:50]
+        # B9: paginação por cursor, mesmo contrato do list_messages.
+        MAX_PAGE_SIZE = 100
+        try:
+            limit = int(request.query_params.get('limit', 50))
+        except (TypeError, ValueError):
+            return ValidationError("limit inválido").to_response()
+        limit = max(1, min(limit, MAX_PAGE_SIZE))
+
+        queryset = Notification.objects.filter(recipient=request.user)
+
+        before = request.query_params.get('before')
+        if before is not None:
+            try:
+                queryset = queryset.filter(id__lt=int(before))
+            except (TypeError, ValueError):
+                return ValidationError("before inválido").to_response()
+
+        notifications = queryset.order_by('-id')[:limit]
 
         serializer = NotificationSerializer(notifications, many=True)
         return Response(serializer.data)
@@ -760,6 +1550,60 @@ def unread_notifications_count(request):
         return handle_exception(e)
 
 
+# MEDIA (B2): arquivos sensíveis saem por endpoint autenticado,
+# nunca por /media/ público.
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def serve_message_attachment(request, message_id):
+    try:
+        try:
+            message = Message.objects.get(id=message_id)
+        except Message.DoesNotExist:
+            return NotFoundError("Anexo").to_response()
+
+        if not message.conversation.participants.filter(id=request.user.id).exists():
+            return ForbiddenError("Você não faz parte dessa conversa").to_response()
+
+        if not message.attachment:
+            return NotFoundError("Anexo").to_response()
+        if message.attachment_status != Message.ATTACHMENT_APPROVED:
+            return NotFoundError("Anexo").to_response()
+
+        response = FileResponse(
+            message.attachment.open('rb'),
+            as_attachment=True,
+            filename=Path(message.attachment.name).name,
+        )
+        response["X-Content-Type-Options"] = "nosniff"
+        response["Content-Disposition"] = f'attachment; filename="{Path(message.attachment.name).name}"'
+        return response
+
+    except Exception as e:
+        return handle_exception(e)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def serve_child_photo(request, child_id):
+    try:
+        try:
+            child = Child.objects.get(id=child_id)
+        except Child.DoesNotExist:
+            return NotFoundError("Foto").to_response()
+
+        if not child.conversation.participants.filter(id=request.user.id).exists():
+            return ForbiddenError("Você não faz parte dessa conversa").to_response()
+
+        if not child.photo:
+            return NotFoundError("Foto").to_response()
+
+        return FileResponse(child.photo.open('rb'))
+
+    except Exception as e:
+        return handle_exception(e)
+
+
 # PDF EXPORT
 
 @api_view(['GET'])
@@ -782,21 +1626,27 @@ def export_conversation_pdf(request, conversation_id):
             return NotFoundError("Conversa").to_response()
 
         # Verify user is participant
-        if request.user not in conversation.participants.all():
-            return ForbiddenError("VocÃª nÃ£o faz parte dessa conversa").to_response()
+        if not conversation.participants.filter(id=request.user.id).exists():
+            return ForbiddenError("Você não faz parte dessa conversa").to_response()
 
-        # Get messages and events
-        messages = Message.objects.filter(conversation_id=conversation_id).order_by('created_at')
-        events = Event.objects.filter(conversation_id=conversation_id).order_by('event_date')
+        # B6: o front envia ?type=messages|events; sem o parâmetro exporta tudo.
+        export_type = request.query_params.get('type', 'all')
+        if export_type not in ('messages', 'events', 'all'):
+            return ValidationError("type deve ser messages, events ou all").to_response()
 
-        # Generate PDF
+        messages = Message.objects.none()
+        events = Event.objects.none()
+        if export_type in ('messages', 'all'):
+            messages = Message.objects.filter(conversation_id=conversation_id).order_by('created_at')
+        if export_type in ('events', 'all'):
+            events = Event.objects.filter(conversation_id=conversation_id).order_by('event_date')
+
         pdf_buffer = generate_conversation_pdf(messages, events, conversation_id)
 
-        # Return as file download
         return FileResponse(
             pdf_buffer,
             as_attachment=True,
-            filename=f'coparent_conversation_{conversation_id}.pdf',
+            filename=f'coparent_{export_type}_{conversation_id}.pdf',
             content_type='application/pdf'
         )
 
